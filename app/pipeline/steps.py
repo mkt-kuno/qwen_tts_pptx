@@ -5,9 +5,9 @@ import json
 import logging
 import shutil
 import sys
+import wave
 import zipfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 
 from app.common.languages import LanguageSpec, resolve_languages
@@ -16,15 +16,42 @@ from app.common.paths import WorkspacePaths
 from app.models.voices import resolve_voice_asset
 from app.slides.export_slides import export_slides
 from app.synthesis.qwen import (
+    SAFE_VOICE_CLONE_GENERATION_PARAMS,
+    VoiceCloneGenerationParams,
     create_voice_clone_prompt,
     detect_device,
     load_model,
+    resolve_voice_clone_language,
+    synthesize_batch_to_files,
     synthesize_to_file,
 )
 from app.video.build import build_multilingual_video, build_videos
 
 
 logger = logging.getLogger(__name__)
+
+ALL_LANGUAGE_TAGS = frozenset({"JA", "EN", "ZH"})
+ANOMALOUS_AUDIO_MIN_DURATION_SEC = 12.0
+ANOMALOUS_AUDIO_SECONDS_PER_CHAR = 0.45
+ANOMALOUS_AUDIO_RETRY_LIMIT = 1
+
+
+@dataclass(frozen=True)
+class _AudioMemoryCacheEntry:
+    wav_path: Path
+    wav_sha256: str
+
+
+@dataclass(frozen=True)
+class _PendingAudioGeneration:
+    slide_number: int
+    qwen_language: str
+    text: str
+    wav_path: Path
+    cache_key: str
+
+
+_AUDIO_MEMORY_CACHE: dict[str, _AudioMemoryCacheEntry] = {}
 
 
 @dataclass(frozen=True)
@@ -119,56 +146,113 @@ def step2_synthesize_audio(
     )
     model = model_result.model
     resolved_device = model_result.device
+    resolved_dtype = model_result.dtype_name
+    generation_params = SAFE_VOICE_CLONE_GENERATION_PARAMS
+    logger.info(
+        "Using conservative generation params: temperature=%.2f top_p=%.2f top_k=%d repetition_penalty=%.2f dtype=%s",
+        generation_params.temperature,
+        generation_params.top_p,
+        generation_params.top_k,
+        generation_params.repetition_penalty,
+        resolved_dtype,
+    )
     prompt = create_voice_clone_prompt(
         model=model,
         ref_audio=voice.audio_path,
         ref_text=voice.transcript,
     )
 
-    cache_root = paths.work / "cache" / "audio"
-    cache_root.mkdir(parents=True, exist_ok=True)
     ref_audio_hash = _sha256_file(voice.audio_path)
     ref_text_hash = _sha256_text(voice.transcript)
+    language_assignments = {
+        spec.tag: resolve_voice_clone_language(model, spec.qwen_language)
+        for spec in active_languages
+    }
+    three_language_mode = {spec.tag for spec in active_languages} == ALL_LANGUAGE_TAGS
 
     generated_count = 0
     cache_hit_count = 0
+    retry_count = 0
 
     for slide_number, tagged in slide_texts:
+        pending: list[_PendingAudioGeneration] = []
         for spec in active_languages:
             text = tagged[spec.tag]
+            qwen_language = language_assignments[spec.tag]
             wav_path = paths.audio_dir(spec.directory_name) / f"page{slide_number}.wav"
-            cache_file = cache_root / spec.directory_name / f"page{slide_number}.json"
-            cache_key = {
-                "slide_number": slide_number,
-                "language": spec.tag,
-                "script_sha256": _sha256_text(text),
-                "model_size": model_size,
-                "device": resolved_device,
-                "dtype": (dtype or "auto"),
-                "ref_audio_sha256": ref_audio_hash,
-                "ref_text_sha256": ref_text_hash,
-            }
+            cache_key = _build_audio_memory_cache_key(
+                text=text,
+                language_tag=spec.tag,
+                qwen_language=qwen_language,
+                model_size=model_size,
+                device=resolved_device,
+                dtype_name=resolved_dtype,
+                ref_audio_sha256=ref_audio_hash,
+                ref_text_sha256=ref_text_hash,
+                generation_params=generation_params,
+            )
 
-            if not force_regenerate and _is_audio_cache_hit(
-                cache_file, wav_path, cache_key
+            if not force_regenerate and _restore_audio_from_memory_cache(
+                cache_key=cache_key,
+                wav_path=wav_path,
             ):
                 cache_hit_count += 1
                 continue
 
-            synthesize_to_file(
-                model=model,
-                prompt=prompt,
-                text=text,
-                language=spec.qwen_language,
-                output_path=wav_path,
+            pending.append(
+                _PendingAudioGeneration(
+                    slide_number=slide_number,
+                    qwen_language=qwen_language,
+                    text=text,
+                    wav_path=wav_path,
+                    cache_key=cache_key,
+                )
             )
-            _write_audio_cache(cache_file=cache_file, cache_key=cache_key)
-            generated_count += 1
+
+        if not pending:
+            continue
+
+        synthesize_batch_to_files(
+            model=model,
+            prompt=prompt,
+            texts=[item.text for item in pending],
+            languages=[item.qwen_language for item in pending],
+            output_paths=[item.wav_path for item in pending],
+            generation_params=generation_params,
+        )
+
+        generated_count += len(pending)
+
+        if three_language_mode:
+            for item in pending:
+                retry_count += _retry_if_anomalous_audio(
+                    model=model,
+                    prompt=prompt,
+                    slide_number=item.slide_number,
+                    text=item.text,
+                    language=item.qwen_language,
+                    output_path=item.wav_path,
+                    generation_params=generation_params,
+                )
+
+        for item in pending:
+            if three_language_mode and _is_anomalously_long_audio(
+                text=item.text,
+                wav_path=item.wav_path,
+            ):
+                logger.warning(
+                    "Skipping memory cache for anomalous audio (slide=%d language=%s).",
+                    item.slide_number,
+                    item.qwen_language,
+                )
+                continue
+            _store_audio_memory_cache(cache_key=item.cache_key, wav_path=item.wav_path)
 
     logger.info(
-        "Audio synthesis finished: generated=%d cache_hits=%d",
+        "Audio synthesis finished: generated=%d cache_hits=%d retries=%d",
         generated_count,
         cache_hit_count,
+        retry_count,
     )
     return AudioSynthesisResult(
         slide_count=len(notes),
@@ -272,29 +356,124 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _is_audio_cache_hit(
-    cache_file: Path, wav_path: Path, expected: dict[str, object]
-) -> bool:
-    if not cache_file.exists() or not wav_path.exists():
+def _build_audio_memory_cache_key(
+    *,
+    text: str,
+    language_tag: str,
+    qwen_language: str,
+    model_size: str,
+    device: str,
+    dtype_name: str,
+    ref_audio_sha256: str,
+    ref_text_sha256: str,
+    generation_params: VoiceCloneGenerationParams,
+) -> str:
+    payload = {
+        "text_sha256": _sha256_text(text),
+        "language": language_tag,
+        "qwen_language": qwen_language,
+        "temperature": generation_params.temperature,
+        "top_p": generation_params.top_p,
+        "top_k": generation_params.top_k,
+        "repetition_penalty": generation_params.repetition_penalty,
+        "do_sample": generation_params.do_sample,
+        "dtype": dtype_name,
+        "model_size": model_size,
+        "device": device,
+        "ref_audio_sha256": ref_audio_sha256,
+        "ref_text_sha256": ref_text_sha256,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _restore_audio_from_memory_cache(*, cache_key: str, wav_path: Path) -> bool:
+    entry = _AUDIO_MEMORY_CACHE.get(cache_key)
+    if entry is None:
         return False
-    try:
-        actual = json.loads(cache_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    if not entry.wav_path.exists():
+        _AUDIO_MEMORY_CACHE.pop(cache_key, None)
         return False
-    for key, expected_value in expected.items():
-        if actual.get(key) != expected_value:
-            return False
+
+    current_hash = _sha256_file(entry.wav_path)
+    if current_hash != entry.wav_sha256:
+        _AUDIO_MEMORY_CACHE.pop(cache_key, None)
+        return False
+
+    if entry.wav_path.resolve() != wav_path.resolve():
+        wav_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(entry.wav_path, wav_path)
     return True
 
 
-def _write_audio_cache(*, cache_file: Path, cache_key: dict[str, object]) -> None:
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        **cache_key,
-        "updated_at": datetime.now(UTC).isoformat(),
-        "format": "wav",
-    }
-    cache_file.write_text(
-        json.dumps(payload, ensure_ascii=True, indent=2),
-        encoding="utf-8",
+def _store_audio_memory_cache(*, cache_key: str, wav_path: Path) -> None:
+    _AUDIO_MEMORY_CACHE[cache_key] = _AudioMemoryCacheEntry(
+        wav_path=wav_path,
+        wav_sha256=_sha256_file(wav_path),
     )
+
+
+def _retry_if_anomalous_audio(
+    *,
+    model,
+    prompt,
+    slide_number: int,
+    text: str,
+    language: str,
+    output_path: Path,
+    generation_params: VoiceCloneGenerationParams,
+) -> int:
+    if not _is_anomalously_long_audio(text=text, wav_path=output_path):
+        return 0
+
+    retry_count = 0
+    for attempt in range(1, ANOMALOUS_AUDIO_RETRY_LIMIT + 1):
+        logger.warning(
+            "Anomalously long audio detected (slide=%d language=%s, chars=%d, duration=%.2fs). Retrying (%d/%d).",
+            slide_number,
+            language,
+            _normalized_text_length(text),
+            _read_wav_duration(output_path),
+            attempt,
+            ANOMALOUS_AUDIO_RETRY_LIMIT,
+        )
+        synthesize_to_file(
+            model=model,
+            prompt=prompt,
+            text=text,
+            language=language,
+            output_path=output_path,
+            generation_params=generation_params,
+        )
+        retry_count += 1
+        if not _is_anomalously_long_audio(text=text, wav_path=output_path):
+            return retry_count
+
+    logger.warning(
+        "Audio still appears anomalously long after retries (slide=%d language=%s, chars=%d, duration=%.2fs).",
+        slide_number,
+        language,
+        _normalized_text_length(text),
+        _read_wav_duration(output_path),
+    )
+    return retry_count
+
+
+def _is_anomalously_long_audio(*, text: str, wav_path: Path) -> bool:
+    text_length = _normalized_text_length(text)
+    if text_length == 0:
+        return False
+    duration = _read_wav_duration(wav_path)
+    if duration < ANOMALOUS_AUDIO_MIN_DURATION_SEC:
+        return False
+    return (duration / text_length) > ANOMALOUS_AUDIO_SECONDS_PER_CHAR
+
+
+def _normalized_text_length(text: str) -> int:
+    return len("".join(text.split()))
+
+
+def _read_wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as wav_file:
+        return wav_file.getnframes() / wav_file.getframerate()

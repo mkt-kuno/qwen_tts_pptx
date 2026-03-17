@@ -6,7 +6,7 @@ The app now uses a Gradio web UI and a compact three-step workflow.
 ## Workflow
 
 1. **Image Export (Windows only)**: `.pptx -> pageN.png`
-2. **Audio Synthesis**: `.pptx + ref wav/txt -> pageN.wav` (with per-page cache)
+2. **Audio Synthesis**: `.pptx + ref wav/txt -> pageN.wav` (with in-memory cache)
 3. **Video Build**: `PNG + WAV -> MP4`
 
 Outputs include:
@@ -68,16 +68,20 @@ python -m app.pipeline.build_movie <deck>.pptx --ref-audio example/kuwano.wav --
 
 ## Cache behavior (Step 2)
 
-The audio step stores per-page cache metadata JSON under `work/cache/audio/`.
+Step 2 uses an in-process audio cache (memory only).
+Cache entries are reused only while the app/process is running and are cleared on restart.
 WAV regeneration is skipped when the cache key matches:
 
 - script SHA256
-- language tag
+- language + Qwen language assignment
+- `temperature` / `top_p` / `top_k` / `repetition_penalty`
 - model/device/dtype settings
 - reference audio SHA256
 - reference text SHA256
 
 Use `--force-regenerate` in CLI (or checkbox in UI) to bypass cache.
+
+When JA/EN/ZH are all active, Step 2 also retries once if a generated WAV is detected as anomalously long relative to the input text length.
 
 ## Linux / Colab note
 

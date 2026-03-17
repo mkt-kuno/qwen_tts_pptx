@@ -6,6 +6,7 @@ import sys
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import soundfile as sf
 import torch
@@ -54,6 +55,38 @@ CUDA_FALLBACK_MESSAGES = (
 class LoadedModel:
     model: object
     device: str
+    dtype_name: str
+
+
+@dataclass(frozen=True)
+class VoiceCloneGenerationParams:
+    do_sample: bool = True
+    top_k: int = 30
+    top_p: float = 0.9
+    temperature: float = 0.7
+    repetition_penalty: float = 1.1
+    subtalker_dosample: bool = True
+    subtalker_top_k: int = 30
+    subtalker_top_p: float = 0.9
+    subtalker_temperature: float = 0.7
+    max_new_tokens: int = 2048
+
+    def as_generate_kwargs(self) -> dict[str, Any]:
+        return {
+            "do_sample": self.do_sample,
+            "top_k": self.top_k,
+            "top_p": self.top_p,
+            "temperature": self.temperature,
+            "repetition_penalty": self.repetition_penalty,
+            "subtalker_dosample": self.subtalker_dosample,
+            "subtalker_top_k": self.subtalker_top_k,
+            "subtalker_top_p": self.subtalker_top_p,
+            "subtalker_temperature": self.subtalker_temperature,
+            "max_new_tokens": self.max_new_tokens,
+        }
+
+
+SAFE_VOICE_CLONE_GENERATION_PARAMS = VoiceCloneGenerationParams()
 
 
 def detect_device(requested: str | None) -> str:
@@ -136,16 +169,17 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 def _load_pretrained_model(
     model_class, model_name: str, device: str, dtype: str | None
-):
+) -> tuple[object, torch.dtype]:
     resolved_dtype = resolve_dtype(dtype, device)
     logger.info(
         "Loading %s on %s (%s)", model_name, device, _dtype_name(resolved_dtype)
     )
-    return model_class.from_pretrained(
+    model = model_class.from_pretrained(
         model_name,
         device_map=device,
         dtype=resolved_dtype,
     )
+    return model, resolved_dtype
 
 
 def _should_retry_on_cpu(device: str, exc: RuntimeError) -> bool:
@@ -161,14 +195,18 @@ def load_model(model_size: str, device: str, dtype: str | None = None) -> Loaded
 
     model_name = MODEL_NAMES[model_size]
     try:
-        model = _load_pretrained_model(
+        model, resolved_dtype = _load_pretrained_model(
             Qwen3TTSModel,
             model_name=model_name,
             device=device,
             dtype=dtype,
         )
         logger.info("Loaded Qwen TTS runtime for %s", model_name)
-        return LoadedModel(model=model, device=device)
+        return LoadedModel(
+            model=model,
+            device=device,
+            dtype_name=_dtype_name(resolved_dtype),
+        )
     except RuntimeError as exc:
         if not _should_retry_on_cpu(device, exc):
             raise
@@ -179,7 +217,7 @@ def load_model(model_size: str, device: str, dtype: str | None = None) -> Loaded
             exc,
         )
         logger.warning("Retrying %s on cpu (float32).", model_name)
-        model = _load_pretrained_model(
+        model, _ = _load_pretrained_model(
             Qwen3TTSModel,
             model_name=model_name,
             device="cpu",
@@ -188,7 +226,7 @@ def load_model(model_size: str, device: str, dtype: str | None = None) -> Loaded
         logger.info(
             "Loaded Qwen TTS runtime for %s on cpu after CUDA fallback", model_name
         )
-        return LoadedModel(model=model, device="cpu")
+        return LoadedModel(model=model, device="cpu", dtype_name="float32")
 
 
 def create_voice_clone_prompt(model, ref_audio: Path, ref_text: str):
@@ -198,6 +236,35 @@ def create_voice_clone_prompt(model, ref_audio: Path, ref_text: str):
     )
     logger.info("Prompt creation finished for %s", ref_audio)
     return prompt
+
+
+def resolve_voice_clone_language(model, requested_language: str) -> str:
+    get_supported_languages = getattr(model, "get_supported_languages", None)
+    if not callable(get_supported_languages):
+        return requested_language
+
+    supported = get_supported_languages()
+    if supported is None:
+        return requested_language
+
+    if not isinstance(supported, (list, tuple, set)):
+        return requested_language
+
+    supported_set = {str(value).lower() for value in supported}
+    if requested_language.lower() in supported_set:
+        return requested_language
+    if "auto" in supported_set:
+        logger.warning(
+            "Qwen language '%s' is unsupported by this model. Falling back to Auto.",
+            requested_language,
+        )
+        return "Auto"
+
+    logger.warning(
+        "Qwen language '%s' is unsupported and Auto is unavailable. Keeping request.",
+        requested_language,
+    )
+    return requested_language
 
 
 def save_prompt_cache(
@@ -242,8 +309,14 @@ def write_silence_wav(
 
 
 def synthesize_to_file(
-    model, prompt, text: str, language: str, output_path: Path
+    model,
+    prompt,
+    text: str,
+    language: str,
+    output_path: Path,
+    generation_params: VoiceCloneGenerationParams = SAFE_VOICE_CLONE_GENERATION_PARAMS,
 ) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     if not text.strip():
         write_silence_wav(output_path)
         return
@@ -253,7 +326,60 @@ def synthesize_to_file(
             text=text,
             language=language,
             voice_clone_prompt=prompt,
+            **generation_params.as_generate_kwargs(),
         )
     except torch.cuda.OutOfMemoryError:
         raise RuntimeError("GPU out of memory. Try --model-size 0.6B") from None
     sf.write(str(output_path), wavs[0], sample_rate)
+
+
+def synthesize_batch_to_files(
+    model,
+    prompt,
+    texts: list[str],
+    languages: list[str],
+    output_paths: list[Path],
+    generation_params: VoiceCloneGenerationParams = SAFE_VOICE_CLONE_GENERATION_PARAMS,
+) -> None:
+    if not (len(texts) == len(languages) == len(output_paths)):
+        raise ValueError(
+            "Batch size mismatch: "
+            f"text={len(texts)}, language={len(languages)}, output={len(output_paths)}"
+        )
+    if not texts:
+        return
+
+    synth_texts: list[str] = []
+    synth_languages: list[str] = []
+    synth_output_paths: list[Path] = []
+
+    for text, language, output_path in zip(texts, languages, output_paths):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if not text.strip():
+            write_silence_wav(output_path)
+            continue
+        synth_texts.append(text)
+        synth_languages.append(language)
+        synth_output_paths.append(output_path)
+
+    if not synth_texts:
+        return
+
+    try:
+        wavs, sample_rate = model.generate_voice_clone(
+            text=synth_texts,
+            language=synth_languages,
+            voice_clone_prompt=prompt,
+            **generation_params.as_generate_kwargs(),
+        )
+    except torch.cuda.OutOfMemoryError:
+        raise RuntimeError("GPU out of memory. Try --model-size 0.6B") from None
+
+    if len(wavs) != len(synth_output_paths):
+        raise RuntimeError(
+            "Unexpected synthesis output count: "
+            f"received={len(wavs)} expected={len(synth_output_paths)}"
+        )
+
+    for wav, output_path in zip(wavs, synth_output_paths):
+        sf.write(str(output_path), wav, sample_rate)
