@@ -255,6 +255,5 @@ def synthesize_to_file(
             voice_clone_prompt=prompt,
         )
     except torch.cuda.OutOfMemoryError:
-        logger.error("GPU out of memory. Try --model-size 0.6B")
-        sys.exit(1)
+        raise RuntimeError("GPU out of memory. Try --model-size 0.6B") from None
     sf.write(str(output_path), wavs[0], sample_rate)
