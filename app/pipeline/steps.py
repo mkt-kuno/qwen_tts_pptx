@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import audioop
 import hashlib
 import json
 import logging
+import math
 import shutil
 import sys
 import wave
@@ -31,8 +33,12 @@ from app.video.build import build_multilingual_video, build_videos
 logger = logging.getLogger(__name__)
 
 ALL_LANGUAGE_TAGS = frozenset({"JA", "EN", "ZH"})
-ANOMALOUS_AUDIO_MIN_DURATION_SEC = 12.0
-ANOMALOUS_AUDIO_SECONDS_PER_CHAR = 0.45
+ANOMALOUS_AUDIO_LONG_MIN_DURATION_SEC = 12.0
+ANOMALOUS_AUDIO_MAX_SECONDS_PER_CHAR = 0.45
+ANOMALOUS_AUDIO_MIN_SECONDS_PER_CHAR = 0.02
+ANOMALOUS_AUDIO_SHORT_MIN_DURATION_SEC = 0.30
+ANOMALOUS_AUDIO_SILENCE_PEAK_RATIO = 0.001
+ANOMALOUS_AUDIO_SILENCE_RMS_RATIO = 0.0005
 ANOMALOUS_AUDIO_RETRY_LIMIT = 1
 
 
@@ -49,6 +55,20 @@ class _PendingAudioGeneration:
     text: str
     wav_path: Path
     cache_key: str
+
+
+@dataclass(frozen=True)
+class _AudioMetrics:
+    duration_sec: float
+    seconds_per_char: float
+    peak_ratio: float
+    rms_ratio: float
+
+
+@dataclass(frozen=True)
+class _AudioAnomaly:
+    kind: str
+    metrics: _AudioMetrics
 
 
 _AUDIO_MEMORY_CACHE: dict[str, _AudioMemoryCacheEntry] = {}
@@ -236,14 +256,17 @@ def step2_synthesize_audio(
                 )
 
         for item in pending:
-            if three_language_mode and _is_anomalously_long_audio(
-                text=item.text,
-                wav_path=item.wav_path,
-            ):
+            anomaly = (
+                _detect_audio_anomaly(text=item.text, wav_path=item.wav_path)
+                if three_language_mode
+                else None
+            )
+            if anomaly is not None:
                 logger.warning(
-                    "Skipping memory cache for anomalous audio (slide=%d language=%s).",
+                    "Skipping memory cache for anomalous audio (slide=%d language=%s reason=%s).",
                     item.slide_number,
                     item.qwen_language,
+                    anomaly.kind,
                 )
                 continue
             _store_audio_memory_cache(cache_key=item.cache_key, wav_path=item.wav_path)
@@ -424,17 +447,21 @@ def _retry_if_anomalous_audio(
     output_path: Path,
     generation_params: VoiceCloneGenerationParams,
 ) -> int:
-    if not _is_anomalously_long_audio(text=text, wav_path=output_path):
+    anomaly = _detect_audio_anomaly(text=text, wav_path=output_path)
+    if anomaly is None:
         return 0
 
     retry_count = 0
     for attempt in range(1, ANOMALOUS_AUDIO_RETRY_LIMIT + 1):
         logger.warning(
-            "Anomalously long audio detected (slide=%d language=%s, chars=%d, duration=%.2fs). Retrying (%d/%d).",
+            "Anomalous audio detected (slide=%d language=%s reason=%s duration=%.2fs sec_per_char=%.3f peak=%.4f rms=%.4f). Retrying (%d/%d).",
             slide_number,
             language,
-            _normalized_text_length(text),
-            _read_wav_duration(output_path),
+            anomaly.kind,
+            anomaly.metrics.duration_sec,
+            anomaly.metrics.seconds_per_char,
+            anomaly.metrics.peak_ratio,
+            anomaly.metrics.rms_ratio,
             attempt,
             ANOMALOUS_AUDIO_RETRY_LIMIT,
         )
@@ -447,33 +474,119 @@ def _retry_if_anomalous_audio(
             generation_params=generation_params,
         )
         retry_count += 1
-        if not _is_anomalously_long_audio(text=text, wav_path=output_path):
+        anomaly = _detect_audio_anomaly(text=text, wav_path=output_path)
+        if anomaly is None:
             return retry_count
 
     logger.warning(
-        "Audio still appears anomalously long after retries (slide=%d language=%s, chars=%d, duration=%.2fs).",
+        "Audio still appears anomalous after retries (slide=%d language=%s reason=%s duration=%.2fs sec_per_char=%.3f peak=%.4f rms=%.4f).",
         slide_number,
         language,
-        _normalized_text_length(text),
-        _read_wav_duration(output_path),
+        anomaly.kind,
+        anomaly.metrics.duration_sec,
+        anomaly.metrics.seconds_per_char,
+        anomaly.metrics.peak_ratio,
+        anomaly.metrics.rms_ratio,
     )
     return retry_count
 
 
-def _is_anomalously_long_audio(*, text: str, wav_path: Path) -> bool:
+def _detect_audio_anomaly(*, text: str, wav_path: Path) -> _AudioAnomaly | None:
     text_length = _normalized_text_length(text)
     if text_length == 0:
-        return False
-    duration = _read_wav_duration(wav_path)
-    if duration < ANOMALOUS_AUDIO_MIN_DURATION_SEC:
-        return False
-    return (duration / text_length) > ANOMALOUS_AUDIO_SECONDS_PER_CHAR
+        return None
+
+    try:
+        metrics = _read_audio_metrics(wav_path=wav_path, text_length=text_length)
+    except (FileNotFoundError, OSError, EOFError, wave.Error):
+        return _AudioAnomaly(
+            kind="invalid_audio",
+            metrics=_AudioMetrics(
+                duration_sec=0.0,
+                seconds_per_char=0.0,
+                peak_ratio=0.0,
+                rms_ratio=0.0,
+            ),
+        )
+
+    if metrics.duration_sec <= 0.0:
+        return _AudioAnomaly(kind="silent_audio", metrics=metrics)
+    if (
+        metrics.peak_ratio <= ANOMALOUS_AUDIO_SILENCE_PEAK_RATIO
+        and metrics.rms_ratio <= ANOMALOUS_AUDIO_SILENCE_RMS_RATIO
+    ):
+        return _AudioAnomaly(kind="silent_audio", metrics=metrics)
+    if (
+        metrics.duration_sec >= ANOMALOUS_AUDIO_LONG_MIN_DURATION_SEC
+        and metrics.seconds_per_char > ANOMALOUS_AUDIO_MAX_SECONDS_PER_CHAR
+    ):
+        return _AudioAnomaly(kind="too_long", metrics=metrics)
+    if (
+        metrics.duration_sec < ANOMALOUS_AUDIO_SHORT_MIN_DURATION_SEC
+        and text_length >= 4
+    ):
+        return _AudioAnomaly(kind="too_short", metrics=metrics)
+    if metrics.seconds_per_char < ANOMALOUS_AUDIO_MIN_SECONDS_PER_CHAR:
+        return _AudioAnomaly(kind="too_short", metrics=metrics)
+
+    return None
+
+
+def _read_audio_metrics(*, wav_path: Path, text_length: int) -> _AudioMetrics:
+    with wave.open(str(wav_path), "rb") as wav_file:
+        channels = max(1, wav_file.getnchannels())
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+
+        if sample_width <= 0 or sample_rate <= 0 or frame_count <= 0:
+            return _AudioMetrics(
+                duration_sec=0.0,
+                seconds_per_char=0.0,
+                peak_ratio=0.0,
+                rms_ratio=0.0,
+            )
+
+        duration_sec = frame_count / sample_rate
+        bytes_per_frame = sample_width * channels
+        remaining_frames = frame_count
+        total_samples = 0
+        sum_rms_square = 0.0
+        peak_abs = 0
+
+        while remaining_frames > 0:
+            raw = wav_file.readframes(min(remaining_frames, 8192))
+            if not raw:
+                break
+            frames_read = len(raw) // bytes_per_frame
+            remaining_frames -= frames_read
+
+            sample_count = len(raw) // sample_width
+            if sample_count == 0:
+                continue
+            chunk_rms = audioop.rms(raw, sample_width)
+            chunk_peak = audioop.max(raw, sample_width)
+            sum_rms_square += float(chunk_rms * chunk_rms) * float(sample_count)
+            total_samples += sample_count
+            peak_abs = max(peak_abs, chunk_peak)
+
+        if total_samples == 0:
+            return _AudioMetrics(
+                duration_sec=duration_sec,
+                seconds_per_char=duration_sec / text_length,
+                peak_ratio=0.0,
+                rms_ratio=0.0,
+            )
+
+        full_scale = float((1 << (8 * sample_width - 1)) - 1)
+        rms_abs = math.sqrt(sum_rms_square / float(total_samples))
+        return _AudioMetrics(
+            duration_sec=duration_sec,
+            seconds_per_char=duration_sec / text_length,
+            peak_ratio=(peak_abs / full_scale) if full_scale > 0 else 0.0,
+            rms_ratio=(rms_abs / full_scale) if full_scale > 0 else 0.0,
+        )
 
 
 def _normalized_text_length(text: str) -> int:
     return len("".join(text.split()))
-
-
-def _read_wav_duration(path: Path) -> float:
-    with wave.open(str(path), "rb") as wav_file:
-        return wav_file.getnframes() / wav_file.getframerate()

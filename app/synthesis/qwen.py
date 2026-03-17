@@ -63,12 +63,12 @@ class VoiceCloneGenerationParams:
     do_sample: bool = True
     top_k: int = 30
     top_p: float = 0.9
-    temperature: float = 0.7
-    repetition_penalty: float = 1.1
+    temperature: float = 1.0
+    repetition_penalty: float = 1.2
     subtalker_dosample: bool = True
     subtalker_top_k: int = 30
     subtalker_top_p: float = 0.9
-    subtalker_temperature: float = 0.7
+    subtalker_temperature: float = 1.0
     max_new_tokens: int = 2048
 
     def as_generate_kwargs(self) -> dict[str, Any]:

@@ -81,7 +81,7 @@ WAV regeneration is skipped when the cache key matches:
 
 Use `--force-regenerate` in CLI (or checkbox in UI) to bypass cache.
 
-When JA/EN/ZH are all active, Step 2 also retries once if a generated WAV is detected as anomalously long relative to the input text length.
+When JA/EN/ZH are all active, Step 2 also retries once if a generated WAV is detected as anomalous (too long, too short, or effectively silent).
 
 ## Linux / Colab note
 
