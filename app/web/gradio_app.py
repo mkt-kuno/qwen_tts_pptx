@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import gradio as gr
@@ -132,7 +133,7 @@ def run_step3(
     )
 
 
-def build_app() -> gr.Blocks:
+def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Blocks:
     with gr.Blocks(title="PowerPoint TTS Movie Builder") as demo:
         gr.Markdown(
             "# PowerPoint TTS Movie Builder\n"
@@ -162,10 +163,10 @@ def build_app() -> gr.Blocks:
                     choices=["0.6B", "1.7B"], value="1.7B", label="Model Size"
                 )
             with gr.Row():
-                device = gr.Textbox(label="Device (blank=auto)", value="")
+                device = gr.Textbox(label="Device (blank=auto)", value=default_device)
                 dtype = gr.Dropdown(
                     choices=["auto", "float16", "bfloat16", "float32"],
-                    value="auto",
+                    value=default_dtype,
                     label="DType",
                 )
             force_regenerate = gr.Checkbox(
@@ -223,7 +224,18 @@ def build_app() -> gr.Blocks:
     return demo
 
 
+def launch_for_colab() -> None:
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    app = build_app(default_device="cuda:0", default_dtype="float16")
+    app.queue(default_concurrency_limit=1)
+    app.launch(share=True, debug=True)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    if os.environ.get("COLAB_RELEASE_TAG"):
+        launch_for_colab()
+        return
     app = build_app()
+    app.queue(default_concurrency_limit=1)
     app.launch()

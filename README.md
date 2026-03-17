@@ -45,6 +45,15 @@ python -m app.web
 
 This starts the Gradio app with tabs for Step 1, Step 2, and Step 3.
 
+## Colab (T4) quick start
+
+Use `colab_run.ipynb` for a Gradio-first Colab workflow.
+
+- Open `colab_run.ipynb` in Colab
+- Set runtime to GPU (T4)
+- Run all cells
+- Open the public Gradio URL and use the same three-step UI
+
 ## Run full pipeline from CLI
 
 ```powershell
