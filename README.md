@@ -40,7 +40,7 @@ conda activate qwentts
 For CUDA users, FlashAttention is optional. The CUDA environment intentionally skips it for maximum setup compatibility. If you want faster inference and your system supports building it, install it manually after environment creation:
 
 ```powershell
-pip install flash-attn --no-build-isolation
+pip install --no-cache-dir --no-build-isolation flash-attn
 ```
 
 ## Run web UI
