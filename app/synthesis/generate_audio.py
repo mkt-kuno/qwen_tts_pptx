@@ -39,7 +39,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref-audio", type=Path, default=None)
     parser.add_argument("--ref-text", type=Path, default=None)
     parser.add_argument("--languages", nargs="+", default=["JA", "EN", "ZH"])
-    parser.add_argument("--model-size", choices=["0.6B", "1.7B"], default="0.6B")
+    parser.add_argument("--model-size", choices=["0.6B", "1.7B"], default="1.7B")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
         "--dtype",

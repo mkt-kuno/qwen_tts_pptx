@@ -55,6 +55,62 @@ def build_videos(
     return outputs
 
 
+def build_multilingual_video(
+    slide_count: int,
+    languages: list[LanguageSpec],
+    paths: WorkspacePaths,
+    slide_padding_sec: float,
+    fps: int,
+    output_name: str = "multilingual.mp4",
+) -> Path:
+    durations = compute_slide_durations(
+        slide_count=slide_count,
+        languages=languages,
+        paths=paths,
+        slide_padding_sec=slide_padding_sec,
+    )
+    output_path = paths.output / output_name
+    video_track = paths.temp / "multilingual.m4v"
+    concat_path = paths.temp / "multilingual.ffconcat"
+    build_slide_video(
+        slides_dir=paths.slides,
+        durations=durations,
+        fps=fps,
+        concat_path=concat_path,
+        output_path=video_track,
+    )
+
+    audio_tracks: list[Path] = []
+    for spec in languages:
+        track_path = paths.temp / f"multilingual-{spec.directory_name}.wav"
+        build_audio_track(
+            audio_dir=paths.audio_dir(spec.directory_name),
+            durations=durations,
+            output_path=track_path,
+        )
+        audio_tracks.append(track_path)
+
+    language_codes = {"JA": "jpn", "EN": "eng", "ZH": "zho"}
+    command = ["ffmpeg", "-y", "-i", str(video_track)]
+    for audio_track in audio_tracks:
+        command.extend(["-i", str(audio_track)])
+
+    command.extend(["-map", "0:v:0"])
+    for index in range(len(audio_tracks)):
+        command.extend(["-map", f"{index + 1}:a:0"])
+
+    command.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "64k"])
+    for index, spec in enumerate(languages):
+        code = language_codes.get(spec.tag, "und")
+        command.extend([f"-metadata:s:a:{index}", f"language={code}"])
+        command.extend([f"-metadata:s:a:{index}", f"title={spec.tag}"])
+
+    command.append(str(output_path))
+    logger.info("Building multilingual video %s", output_path)
+    subprocess.run(command, check=True)
+    return output_path
+
+
 def compute_slide_durations(
     slide_count: int,
     languages: list[LanguageSpec],

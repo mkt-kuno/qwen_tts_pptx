@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.gui.main import main
+from app.web.gradio_app import main
 
 
 if __name__ == "__main__":
