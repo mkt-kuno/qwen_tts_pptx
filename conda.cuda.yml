@@ -1,0 +1,19 @@
+name: qwentts-cuda
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - cffi
+  - charset-normalizer
+  - pillow
+  - pip
+  - ffmpeg
+  - libsndfile
+  - ninja
+  - numpy=1.26.4
+  - packaging
+  - setuptools
+  - sox
+  - wheel
+  - pip:
+      - -r requirements/pip-cuda.txt
