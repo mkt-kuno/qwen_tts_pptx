@@ -18,7 +18,10 @@ wheels/
 # Generated pipeline outputs
 work/
 output/
-ja/
+jp/
 en/
 zh/
+es/
+it/
+fr/
 example/

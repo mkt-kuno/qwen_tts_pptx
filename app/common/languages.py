@@ -12,23 +12,41 @@ class LanguageSpec:
 
 
 LANGUAGE_SPECS: dict[str, LanguageSpec] = {
-    "JA": LanguageSpec(
-        tag="JA",
-        directory_name="ja",
-        qwen_language="Japanese",
-        output_name="ja.mp4",
-    ),
     "EN": LanguageSpec(
         tag="EN",
         directory_name="en",
         qwen_language="English",
         output_name="en.mp4",
     ),
+    "JP": LanguageSpec(
+        tag="JP",
+        directory_name="jp",
+        qwen_language="Japanese",
+        output_name="jp.mp4",
+    ),
     "ZH": LanguageSpec(
         tag="ZH",
         directory_name="zh",
         qwen_language="Chinese",
         output_name="zh.mp4",
+    ),
+    "ES": LanguageSpec(
+        tag="ES",
+        directory_name="es",
+        qwen_language="Spanish",
+        output_name="es.mp4",
+    ),
+    "IT": LanguageSpec(
+        tag="IT",
+        directory_name="it",
+        qwen_language="Italian",
+        output_name="it.mp4",
+    ),
+    "FR": LanguageSpec(
+        tag="FR",
+        directory_name="fr",
+        qwen_language="French",
+        output_name="fr.mp4",
     ),
 }
 

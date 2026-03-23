@@ -69,6 +69,7 @@ def build_multilingual_video(
         paths=paths,
         slide_padding_sec=slide_padding_sec,
     )
+    ordered_languages = _order_multilingual_languages(languages)
     output_path = paths.output / output_name
     video_track = paths.temp / "multilingual.m4v"
     concat_path = paths.temp / "multilingual.ffconcat"
@@ -81,7 +82,7 @@ def build_multilingual_video(
     )
 
     audio_tracks: list[Path] = []
-    for spec in languages:
+    for spec in ordered_languages:
         track_path = paths.temp / f"multilingual-{spec.directory_name}.wav"
         build_audio_track(
             audio_dir=paths.audio_dir(spec.directory_name),
@@ -90,7 +91,14 @@ def build_multilingual_video(
         )
         audio_tracks.append(track_path)
 
-    language_codes = {"JA": "jpn", "EN": "eng", "ZH": "zho"}
+    language_codes = {
+        "EN": "eng",
+        "JP": "jpn",
+        "ZH": "zho",
+        "ES": "spa",
+        "IT": "ita",
+        "FR": "fra",
+    }
     command = ["ffmpeg", "-y", "-i", str(video_track)]
     for audio_track in audio_tracks:
         command.extend(["-i", str(audio_track)])
@@ -100,15 +108,26 @@ def build_multilingual_video(
         command.extend(["-map", f"{index + 1}:a:0"])
 
     command.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "64k"])
-    for index, spec in enumerate(languages):
+    for index, spec in enumerate(ordered_languages):
         code = language_codes.get(spec.tag, "und")
         command.extend([f"-metadata:s:a:{index}", f"language={code}"])
         command.extend([f"-metadata:s:a:{index}", f"title={spec.tag}"])
+
+    if ordered_languages and ordered_languages[0].tag == "EN":
+        command.extend(["-disposition:a:0", "default"])
+        for index in range(1, len(ordered_languages)):
+            command.extend([f"-disposition:a:{index}", "0"])
 
     command.append(str(output_path))
     logger.info("Building multilingual video %s", output_path)
     subprocess.run(command, check=True)
     return output_path
+
+
+def _order_multilingual_languages(languages: list[LanguageSpec]) -> list[LanguageSpec]:
+    english = [spec for spec in languages if spec.tag == "EN"]
+    others = [spec for spec in languages if spec.tag != "EN"]
+    return [*english, *others]
 
 
 def compute_slide_durations(

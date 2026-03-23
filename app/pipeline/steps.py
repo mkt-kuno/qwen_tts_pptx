@@ -32,7 +32,7 @@ from app.video.build import build_multilingual_video, build_videos
 
 logger = logging.getLogger(__name__)
 
-ALL_LANGUAGE_TAGS = frozenset({"JA", "EN", "ZH"})
+ANOMALOUS_AUDIO_RETRY_LANGUAGE_TAGS = frozenset({"JP", "EN", "ZH"})
 ANOMALOUS_AUDIO_LONG_MIN_DURATION_SEC = 12.0
 ANOMALOUS_AUDIO_MAX_SECONDS_PER_CHAR = 0.45
 ANOMALOUS_AUDIO_MIN_SECONDS_PER_CHAR = 0.02
@@ -188,7 +188,9 @@ def step2_synthesize_audio(
         spec.tag: resolve_voice_clone_language(model, spec.qwen_language)
         for spec in active_languages
     }
-    three_language_mode = {spec.tag for spec in active_languages} == ALL_LANGUAGE_TAGS
+    retry_for_anomalies = ANOMALOUS_AUDIO_RETRY_LANGUAGE_TAGS.issubset(
+        {spec.tag for spec in active_languages}
+    )
 
     generated_count = 0
     cache_hit_count = 0
@@ -243,7 +245,7 @@ def step2_synthesize_audio(
 
         generated_count += len(pending)
 
-        if three_language_mode:
+        if retry_for_anomalies:
             for item in pending:
                 retry_count += _retry_if_anomalous_audio(
                     model=model,
@@ -258,7 +260,7 @@ def step2_synthesize_audio(
         for item in pending:
             anomaly = (
                 _detect_audio_anomaly(text=item.text, wav_path=item.wav_path)
-                if three_language_mode
+                if retry_for_anomalies
                 else None
             )
             if anomaly is not None:

@@ -11,8 +11,12 @@ The app now uses a Gradio web UI and a compact three-step workflow.
 
 Outputs include:
 
-- Per-language MP4 (`ja.mp4`, `en.mp4`, `zh.mp4`)
+- Per-language MP4 (`en.mp4`, `jp.mp4`, `zh.mp4`, `es.mp4`, `it.mp4`, `fr.mp4`)
 - Multilingual MP4 (`multilingual.mp4`, one video track + multiple audio tracks)
+
+In `multilingual.mp4`, EN is muxed as the first audio track and marked as default.
+
+Supported note tags (ISO 639-1): `EN`, `JP`, `ZH`, `ES`, `IT`, `FR`
 
 `PPTX` is required for script extraction in Step 2.
 
@@ -63,8 +67,19 @@ Use `colab_run.ipynb` for a Gradio-first Colab workflow.
 ## Run full pipeline from CLI
 
 ```powershell
-python -m app.pipeline.build_movie <deck>.pptx --ref-audio example/kuwano.wav --ref-text example/kuwano.txt --languages JA EN ZH
+python -m app.pipeline.build_movie <deck>.pptx --ref-audio example/kuwano.wav --ref-text example/kuwano.txt --languages EN JP ZH ES IT FR
 ```
+
+## Fill missing multilingual note tags from JP (CLI)
+
+Use local Ollama (`translategemma:4b`) to translate missing note blocks for `EN/ZH/ES/IT/FR` from `[JP]... [JP]` text on each slide.
+The CLI first requests all missing tags in one JSON response while passing existing non-JP note blocks as terminology references, then falls back per tag only for missing/invalid outputs.
+
+```powershell
+python -m app.pipeline.translate_notes_multi <deck>.pptx
+```
+
+The command writes `<deck>_multi.pptx` in the same directory and overwrites it if it already exists.
 
 ## Cache behavior (Step 2)
 
@@ -81,12 +96,12 @@ WAV regeneration is skipped when the cache key matches:
 
 Use `--force-regenerate` in CLI (or checkbox in UI) to bypass cache.
 
-When JA/EN/ZH are all active, Step 2 also retries once if a generated WAV is detected as anomalous (too long, too short, or effectively silent).
+When JP/EN/ZH are all active, Step 2 also retries once if a generated WAV is detected as anomalous (too long, too short, or effectively silent).
 
 ## Linux / Colab note
 
 Step 1 uses PowerPoint COM and is Windows-only.
-On Linux/Colab, upload a `slides.zip` containing `page1.png`, `page2.png`, ... and an `audio.zip` containing `ja/`, `en/`, `zh/` WAV folders in Step 3.
+On Linux/Colab, upload a `slides.zip` containing `page1.png`, `page2.png`, ... and an `audio.zip` containing `en/`, `jp/`, `zh/`, `es/`, `it/`, `fr/` WAV folders in Step 3.
 
 ## Verification
 

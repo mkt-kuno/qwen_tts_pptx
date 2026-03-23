@@ -155,8 +155,8 @@ def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Bl
             ref_text = gr.File(label="Ref Text", file_types=[".txt"], type="filepath")
             with gr.Row():
                 languages = gr.CheckboxGroup(
-                    choices=["JA", "EN", "ZH"],
-                    value=["JA", "EN", "ZH"],
+                    choices=["EN", "JP", "ZH", "ES", "IT", "FR"],
+                    value=["EN", "JP", "ZH", "ES", "IT", "FR"],
                     label="Languages",
                 )
                 model_size = gr.Dropdown(
@@ -181,7 +181,9 @@ def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Bl
                 "Optional: upload ZIPs to import data. If omitted, existing work/ data is used."
             )
             slides_zip = gr.File(label="Slides ZIP (pageN.png)", type="filepath")
-            audio_zip = gr.File(label="Audio ZIP (ja/en/zh folders)", type="filepath")
+            audio_zip = gr.File(
+                label="Audio ZIP (en/jp/zh/es/it/fr folders)", type="filepath"
+            )
             with gr.Row():
                 step3_padding = gr.Number(label="Padding Sec", value=1.5)
                 step3_fps = gr.Number(label="FPS", value=5, precision=0)
