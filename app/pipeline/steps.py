@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import statistics
 import shutil
 import sys
 import wave
@@ -33,13 +34,27 @@ from app.video.build import build_multilingual_video, build_videos
 
 logger = logging.getLogger(__name__)
 
-ANOMALOUS_AUDIO_RETRY_LANGUAGE_TAGS = frozenset({"JP", "EN", "ZH"})
-ANOMALOUS_AUDIO_LONG_MIN_DURATION_SEC = 12.0
+ANOMALOUS_AUDIO_MAX_DURATION_SEC = 120.0
 ANOMALOUS_AUDIO_MAX_SECONDS_PER_CHAR = 0.45
+ANOMALOUS_AUDIO_MAX_SECONDS_PER_CHAR_BY_TAG: dict[str, float] = {
+    "ZH": 0.32,
+}
 ANOMALOUS_AUDIO_MIN_SECONDS_PER_CHAR = 0.02
 ANOMALOUS_AUDIO_SHORT_MIN_DURATION_SEC = 0.30
 ANOMALOUS_AUDIO_SILENCE_PEAK_RATIO = 0.001
 ANOMALOUS_AUDIO_SILENCE_RMS_RATIO = 0.0005
+ANOMALOUS_AUDIO_MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024
+ANOMALOUS_AUDIO_MAX_BYTES_PER_CHAR = 22000.0
+ANOMALOUS_AUDIO_MAX_BYTES_PER_CHAR_BY_TAG: dict[str, float] = {
+    "ZH": 16000.0,
+}
+ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_RATIO = 3.0
+ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_RATIO_BY_TAG: dict[str, float] = {
+    "ZH": 2.2,
+}
+ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_DURATION_SEC = 8.0
+ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_GAP_SEC = 2.5
+ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_PEERS = 2
 ANOMALOUS_AUDIO_RETRY_LIMIT = 1
 
 
@@ -65,12 +80,22 @@ class _AudioMetrics:
     seconds_per_char: float
     peak_ratio: float
     rms_ratio: float
+    file_size_bytes: int
+    bytes_per_char: float
 
 
 @dataclass(frozen=True)
 class _AudioAnomaly:
     kind: str
     metrics: _AudioMetrics
+
+
+@dataclass(frozen=True)
+class _DurationOutlier:
+    item: _PendingAudioGeneration
+    duration_sec: float
+    peer_median_sec: float
+    ratio_to_peer: float
 
 
 _AUDIO_MEMORY_CACHE: dict[str, _AudioMemoryCacheEntry] = {}
@@ -203,9 +228,6 @@ def step2_synthesize_audio(
         spec.tag: resolve_voice_clone_language(model, spec.qwen_language)
         for spec in active_languages
     }
-    retry_for_anomalies = ANOMALOUS_AUDIO_RETRY_LANGUAGE_TAGS.issubset(
-        {spec.tag for spec in active_languages}
-    )
 
     generated_count = 0
     cache_hit_count = 0
@@ -213,6 +235,7 @@ def step2_synthesize_audio(
 
     for slide_number, tagged in slide_texts:
         pending: list[_PendingAudioGeneration] = []
+        slide_items: list[_PendingAudioGeneration] = []
         for spec in language_specs:
             _emit_step2_progress(
                 callback=progress_callback,
@@ -239,6 +262,15 @@ def step2_synthesize_audio(
                 ref_text_sha256=ref_text_hash,
                 generation_params=generation_params,
             )
+            item = _PendingAudioGeneration(
+                slide_number=slide_number,
+                language_tag=spec.tag,
+                qwen_language=qwen_language,
+                text=text,
+                wav_path=wav_path,
+                cache_key=cache_key,
+            )
+            slide_items.append(item)
 
             if not force_regenerate and _restore_audio_from_memory_cache(
                 cache_key=cache_key,
@@ -248,48 +280,48 @@ def step2_synthesize_audio(
                 completed_units += 1
                 continue
 
-            pending.append(
-                _PendingAudioGeneration(
-                    slide_number=slide_number,
-                    language_tag=spec.tag,
-                    qwen_language=qwen_language,
-                    text=text,
-                    wav_path=wav_path,
-                    cache_key=cache_key,
-                )
+            pending.append(item)
+
+        if pending:
+            synthesize_batch_to_files(
+                model=model,
+                prompt=prompt,
+                texts=[item.text for item in pending],
+                languages=[item.qwen_language for item in pending],
+                output_paths=[item.wav_path for item in pending],
+                generation_params=generation_params,
+            )
+            generated_count += len(pending)
+
+        for item in slide_items:
+            retry_count += _retry_if_anomalous_audio(
+                model=model,
+                prompt=prompt,
+                slide_number=item.slide_number,
+                language_tag=item.language_tag,
+                qwen_language=item.qwen_language,
+                text=item.text,
+                output_path=item.wav_path,
+                generation_params=generation_params,
             )
 
-        if not pending:
-            continue
+        for _ in range(len(slide_items)):
+            outlier = _find_duration_outlier_in_slide(slide_items)
+            if outlier is None:
+                break
+            retry_count += _retry_duration_outlier(
+                model=model,
+                prompt=prompt,
+                outlier=outlier,
+                generation_params=generation_params,
+            )
 
-        synthesize_batch_to_files(
-            model=model,
-            prompt=prompt,
-            texts=[item.text for item in pending],
-            languages=[item.qwen_language for item in pending],
-            output_paths=[item.wav_path for item in pending],
-            generation_params=generation_params,
-        )
-
-        generated_count += len(pending)
-
-        if retry_for_anomalies:
-            for item in pending:
-                retry_count += _retry_if_anomalous_audio(
-                    model=model,
-                    prompt=prompt,
-                    slide_number=item.slide_number,
-                    text=item.text,
-                    language=item.qwen_language,
-                    output_path=item.wav_path,
-                    generation_params=generation_params,
-                )
-
-        for item in pending:
-            anomaly = (
-                _detect_audio_anomaly(text=item.text, wav_path=item.wav_path)
-                if retry_for_anomalies
-                else None
+        pending_cache_keys = {item.cache_key for item in pending}
+        for item in slide_items:
+            anomaly = _detect_audio_anomaly(
+                text=item.text,
+                wav_path=item.wav_path,
+                language_tag=item.language_tag,
             )
             if anomaly is not None:
                 logger.warning(
@@ -298,10 +330,12 @@ def step2_synthesize_audio(
                     item.language_tag,
                     anomaly.kind,
                 )
-                completed_units += 1
+                if item.cache_key in pending_cache_keys:
+                    completed_units += 1
                 continue
             _store_audio_memory_cache(cache_key=item.cache_key, wav_path=item.wav_path)
-            completed_units += 1
+            if item.cache_key in pending_cache_keys:
+                completed_units += 1
 
     logger.info(
         "Audio synthesis finished: generated=%d cache_hits=%d retries=%d",
@@ -494,24 +528,31 @@ def _retry_if_anomalous_audio(
     model,
     prompt,
     slide_number: int,
+    language_tag: str,
+    qwen_language: str,
     text: str,
-    language: str,
     output_path: Path,
     generation_params: VoiceCloneGenerationParams,
 ) -> int:
-    anomaly = _detect_audio_anomaly(text=text, wav_path=output_path)
+    anomaly = _detect_audio_anomaly(
+        text=text,
+        wav_path=output_path,
+        language_tag=language_tag,
+    )
     if anomaly is None:
         return 0
 
     retry_count = 0
     for attempt in range(1, ANOMALOUS_AUDIO_RETRY_LIMIT + 1):
         logger.warning(
-            "Anomalous audio detected (slide=%d language=%s reason=%s duration=%.2fs sec_per_char=%.3f peak=%.4f rms=%.4f). Retrying (%d/%d).",
+            "Anomalous audio detected (slide=%d language=%s reason=%s duration=%.2fs sec_per_char=%.3f size=%.2fMB bytes_per_char=%.1f peak=%.4f rms=%.4f). Retrying (%d/%d).",
             slide_number,
-            language,
+            language_tag,
             anomaly.kind,
             anomaly.metrics.duration_sec,
             anomaly.metrics.seconds_per_char,
+            anomaly.metrics.file_size_bytes / (1024 * 1024),
+            anomaly.metrics.bytes_per_char,
             anomaly.metrics.peak_ratio,
             anomaly.metrics.rms_ratio,
             attempt,
@@ -521,29 +562,188 @@ def _retry_if_anomalous_audio(
             model=model,
             prompt=prompt,
             text=text,
-            language=language,
+            language=qwen_language,
             output_path=output_path,
             generation_params=generation_params,
         )
         retry_count += 1
-        anomaly = _detect_audio_anomaly(text=text, wav_path=output_path)
+        anomaly = _detect_audio_anomaly(
+            text=text,
+            wav_path=output_path,
+            language_tag=language_tag,
+        )
         if anomaly is None:
             return retry_count
 
     logger.warning(
-        "Audio still appears anomalous after retries (slide=%d language=%s reason=%s duration=%.2fs sec_per_char=%.3f peak=%.4f rms=%.4f).",
+        "Audio still appears anomalous after retries (slide=%d language=%s reason=%s duration=%.2fs sec_per_char=%.3f size=%.2fMB bytes_per_char=%.1f peak=%.4f rms=%.4f).",
         slide_number,
-        language,
+        language_tag,
         anomaly.kind,
         anomaly.metrics.duration_sec,
         anomaly.metrics.seconds_per_char,
+        anomaly.metrics.file_size_bytes / (1024 * 1024),
+        anomaly.metrics.bytes_per_char,
         anomaly.metrics.peak_ratio,
         anomaly.metrics.rms_ratio,
     )
+    if anomaly.kind in {"too_long", "too_large"}:
+        raise RuntimeError(
+            "Generated audio remains too long/large after retry "
+            f"(slide={slide_number} language={language_tag} reason={anomaly.kind} "
+            f"duration={anomaly.metrics.duration_sec:.2f}s size={anomaly.metrics.file_size_bytes / (1024 * 1024):.2f}MB)."
+        )
     return retry_count
 
 
-def _detect_audio_anomaly(*, text: str, wav_path: Path) -> _AudioAnomaly | None:
+def _find_duration_outlier_in_slide(
+    slide_items: list[_PendingAudioGeneration],
+) -> _DurationOutlier | None:
+    if len(slide_items) < (ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_PEERS + 1):
+        return None
+
+    durations: dict[str, float] = {}
+    for item in slide_items:
+        duration_sec = _read_duration_sec_for_item(item)
+        if duration_sec is None:
+            continue
+        durations[item.cache_key] = duration_sec
+
+    if len(durations) < (ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_PEERS + 1):
+        return None
+
+    strongest_outlier: _DurationOutlier | None = None
+    for item in slide_items:
+        duration_sec = durations.get(item.cache_key)
+        if duration_sec is None:
+            continue
+        peer_durations = [
+            value for key, value in durations.items() if key != item.cache_key
+        ]
+        if len(peer_durations) < ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_PEERS:
+            continue
+
+        peer_median_sec = statistics.median(peer_durations)
+        if peer_median_sec <= 0.0:
+            continue
+        ratio_to_peer = duration_sec / peer_median_sec
+        if not _is_duration_outlier(
+            language_tag=item.language_tag,
+            duration_sec=duration_sec,
+            peer_median_sec=peer_median_sec,
+            ratio_to_peer=ratio_to_peer,
+        ):
+            continue
+
+        candidate = _DurationOutlier(
+            item=item,
+            duration_sec=duration_sec,
+            peer_median_sec=peer_median_sec,
+            ratio_to_peer=ratio_to_peer,
+        )
+        if (
+            strongest_outlier is None
+            or candidate.ratio_to_peer > strongest_outlier.ratio_to_peer
+        ):
+            strongest_outlier = candidate
+
+    return strongest_outlier
+
+
+def _retry_duration_outlier(
+    *,
+    model,
+    prompt,
+    outlier: _DurationOutlier,
+    generation_params: VoiceCloneGenerationParams,
+) -> int:
+    item = outlier.item
+    retry_count = 0
+
+    for attempt in range(1, ANOMALOUS_AUDIO_RETRY_LIMIT + 1):
+        logger.warning(
+            "Duration outlier detected (slide=%d language=%s duration=%.2fs median_other=%.2fs ratio=%.2f). Retrying suspicious language only (%d/%d).",
+            item.slide_number,
+            item.language_tag,
+            outlier.duration_sec,
+            outlier.peer_median_sec,
+            outlier.ratio_to_peer,
+            attempt,
+            ANOMALOUS_AUDIO_RETRY_LIMIT,
+        )
+        synthesize_to_file(
+            model=model,
+            prompt=prompt,
+            text=item.text,
+            language=item.qwen_language,
+            output_path=item.wav_path,
+            generation_params=generation_params,
+        )
+        retry_count += 1
+
+        refreshed_duration = _read_duration_sec_for_item(item)
+        if refreshed_duration is None:
+            continue
+        refreshed_ratio = (
+            refreshed_duration / outlier.peer_median_sec
+            if outlier.peer_median_sec > 0.0
+            else float("inf")
+        )
+        if not _is_duration_outlier(
+            language_tag=item.language_tag,
+            duration_sec=refreshed_duration,
+            peer_median_sec=outlier.peer_median_sec,
+            ratio_to_peer=refreshed_ratio,
+        ):
+            return retry_count
+        outlier = _DurationOutlier(
+            item=item,
+            duration_sec=refreshed_duration,
+            peer_median_sec=outlier.peer_median_sec,
+            ratio_to_peer=refreshed_ratio,
+        )
+
+    raise RuntimeError(
+        "Generated audio remains an outlier after retry "
+        f"(slide={item.slide_number} language={item.language_tag} "
+        f"duration={outlier.duration_sec:.2f}s median_other={outlier.peer_median_sec:.2f}s ratio={outlier.ratio_to_peer:.2f})."
+    )
+
+
+def _is_duration_outlier(
+    *,
+    language_tag: str,
+    duration_sec: float,
+    peer_median_sec: float,
+    ratio_to_peer: float,
+) -> bool:
+    ratio_threshold = ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_RATIO_BY_TAG.get(
+        language_tag.upper(), ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_RATIO
+    )
+    return (
+        duration_sec >= ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_DURATION_SEC
+        and (duration_sec - peer_median_sec)
+        >= ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_GAP_SEC
+        and ratio_to_peer >= ratio_threshold
+    )
+
+
+def _read_duration_sec_for_item(item: _PendingAudioGeneration) -> float | None:
+    text_length = _normalized_text_length(item.text)
+    if text_length == 0:
+        return None
+    try:
+        metrics = _read_audio_metrics(wav_path=item.wav_path, text_length=text_length)
+    except (FileNotFoundError, OSError, EOFError, wave.Error):
+        return None
+    if metrics.duration_sec <= 0.0:
+        return None
+    return metrics.duration_sec
+
+
+def _detect_audio_anomaly(
+    *, text: str, wav_path: Path, language_tag: str
+) -> _AudioAnomaly | None:
     text_length = _normalized_text_length(text)
     if text_length == 0:
         return None
@@ -558,6 +758,8 @@ def _detect_audio_anomaly(*, text: str, wav_path: Path) -> _AudioAnomaly | None:
                 seconds_per_char=0.0,
                 peak_ratio=0.0,
                 rms_ratio=0.0,
+                file_size_bytes=0,
+                bytes_per_char=0.0,
             ),
         )
 
@@ -568,10 +770,21 @@ def _detect_audio_anomaly(*, text: str, wav_path: Path) -> _AudioAnomaly | None:
         and metrics.rms_ratio <= ANOMALOUS_AUDIO_SILENCE_RMS_RATIO
     ):
         return _AudioAnomaly(kind="silent_audio", metrics=metrics)
-    if (
-        metrics.duration_sec >= ANOMALOUS_AUDIO_LONG_MIN_DURATION_SEC
-        and metrics.seconds_per_char > ANOMALOUS_AUDIO_MAX_SECONDS_PER_CHAR
-    ):
+
+    max_seconds_per_char = ANOMALOUS_AUDIO_MAX_SECONDS_PER_CHAR_BY_TAG.get(
+        language_tag.upper(), ANOMALOUS_AUDIO_MAX_SECONDS_PER_CHAR
+    )
+    max_bytes_per_char = ANOMALOUS_AUDIO_MAX_BYTES_PER_CHAR_BY_TAG.get(
+        language_tag.upper(), ANOMALOUS_AUDIO_MAX_BYTES_PER_CHAR
+    )
+
+    if metrics.duration_sec > ANOMALOUS_AUDIO_MAX_DURATION_SEC:
+        return _AudioAnomaly(kind="too_long", metrics=metrics)
+    if metrics.file_size_bytes > ANOMALOUS_AUDIO_MAX_FILE_SIZE_BYTES:
+        return _AudioAnomaly(kind="too_large", metrics=metrics)
+    if text_length >= 2 and metrics.bytes_per_char > max_bytes_per_char:
+        return _AudioAnomaly(kind="too_large", metrics=metrics)
+    if text_length >= 2 and metrics.seconds_per_char > max_seconds_per_char:
         return _AudioAnomaly(kind="too_long", metrics=metrics)
     if (
         metrics.duration_sec < ANOMALOUS_AUDIO_SHORT_MIN_DURATION_SEC
@@ -585,6 +798,9 @@ def _detect_audio_anomaly(*, text: str, wav_path: Path) -> _AudioAnomaly | None:
 
 
 def _read_audio_metrics(*, wav_path: Path, text_length: int) -> _AudioMetrics:
+    file_size_bytes = wav_path.stat().st_size
+    bytes_per_char = file_size_bytes / text_length
+
     with wave.open(str(wav_path), "rb") as wav_file:
         channels = max(1, wav_file.getnchannels())
         sample_width = wav_file.getsampwidth()
@@ -597,6 +813,8 @@ def _read_audio_metrics(*, wav_path: Path, text_length: int) -> _AudioMetrics:
                 seconds_per_char=0.0,
                 peak_ratio=0.0,
                 rms_ratio=0.0,
+                file_size_bytes=file_size_bytes,
+                bytes_per_char=bytes_per_char,
             )
 
         duration_sec = frame_count / sample_rate
@@ -628,6 +846,8 @@ def _read_audio_metrics(*, wav_path: Path, text_length: int) -> _AudioMetrics:
                 seconds_per_char=duration_sec / text_length,
                 peak_ratio=0.0,
                 rms_ratio=0.0,
+                file_size_bytes=file_size_bytes,
+                bytes_per_char=bytes_per_char,
             )
 
         full_scale = float((1 << (8 * sample_width - 1)) - 1)
@@ -637,6 +857,8 @@ def _read_audio_metrics(*, wav_path: Path, text_length: int) -> _AudioMetrics:
             seconds_per_char=duration_sec / text_length,
             peak_ratio=(peak_abs / full_scale) if full_scale > 0 else 0.0,
             rms_ratio=(rms_abs / full_scale) if full_scale > 0 else 0.0,
+            file_size_bytes=file_size_bytes,
+            bytes_per_char=bytes_per_char,
         )
 
 
