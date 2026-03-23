@@ -101,7 +101,7 @@ class Step2ProgressUpdate:
 @dataclass(frozen=True)
 class VideoBuildResult:
     per_language_outputs: list[Path]
-    multilingual_output: Path
+    multilingual_output: Path | None
 
 
 def step1_export_images(
@@ -323,26 +323,46 @@ def step3_build_videos(
     languages: list[str],
     slide_padding_sec: float,
     fps: int,
+    output_language_tags: list[str] | None = None,
+    include_multilingual: bool = True,
 ) -> VideoBuildResult:
+    if not include_multilingual and output_language_tags is not None:
+        if len(output_language_tags) == 0:
+            raise ValueError("Select at least one video output.")
+
     paths = WorkspacePaths.from_root(project_root)
     paths.ensure_directories()
     language_specs = resolve_languages(languages)
+    selected_language_specs = _resolve_output_language_specs(
+        requested_tags=output_language_tags,
+        available_languages=language_specs,
+    )
+
+    if not include_multilingual and not selected_language_specs:
+        raise ValueError("Select at least one video output.")
+
     slide_count = _count_slides(paths.slides)
-    per_language_outputs = build_videos(
-        slide_count=slide_count,
-        languages=language_specs,
-        paths=paths,
-        slide_padding_sec=slide_padding_sec,
-        fps=fps,
-    )
-    multilingual_output = build_multilingual_video(
-        slide_count=slide_count,
-        languages=language_specs,
-        paths=paths,
-        slide_padding_sec=slide_padding_sec,
-        fps=fps,
-        output_name="multilingual.mp4",
-    )
+    per_language_outputs: list[Path] = []
+    if selected_language_specs:
+        per_language_outputs = build_videos(
+            slide_count=slide_count,
+            languages=selected_language_specs,
+            paths=paths,
+            slide_padding_sec=slide_padding_sec,
+            fps=fps,
+        )
+
+    multilingual_output: Path | None = None
+    if include_multilingual:
+        multilingual_output = build_multilingual_video(
+            slide_count=slide_count,
+            languages=language_specs,
+            paths=paths,
+            slide_padding_sec=slide_padding_sec,
+            fps=fps,
+            output_name="multilingual.mp4",
+        )
+
     return VideoBuildResult(
         per_language_outputs=per_language_outputs,
         multilingual_output=multilingual_output,
@@ -642,3 +662,25 @@ def _emit_step2_progress(
             language_tag=language_tag,
         )
     )
+
+
+def _resolve_output_language_specs(
+    *,
+    requested_tags: list[str] | None,
+    available_languages: list[LanguageSpec],
+) -> list[LanguageSpec]:
+    if requested_tags is None:
+        return available_languages
+
+    available_by_tag = {spec.tag: spec for spec in available_languages}
+    selected_specs: list[LanguageSpec] = []
+    for raw_tag in requested_tags:
+        tag = raw_tag.upper()
+        spec = available_by_tag.get(tag)
+        if spec is None:
+            available = ", ".join(spec.tag for spec in available_languages)
+            raise ValueError(
+                f"Output language '{raw_tag}' is not included in selected languages ({available})."
+            )
+        selected_specs.append(spec)
+    return selected_specs

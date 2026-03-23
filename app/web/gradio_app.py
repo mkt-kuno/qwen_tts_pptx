@@ -25,6 +25,8 @@ from app.pipeline.steps import (
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 logger = logging.getLogger(__name__)
+LANGUAGE_CHOICES = ["EN", "JP", "ZH", "ES", "IT", "FR"]
+STEP3_OUTPUT_CHOICES = ["MULTI", *LANGUAGE_CHOICES]
 
 
 def _project_root_from_pptx(pptx_path: Path) -> Path:
@@ -156,12 +158,26 @@ def run_step3(
     slides_zip_file: str | None,
     audio_zip_file: str | None,
     languages: list[str],
+    output_formats: list[str],
     slide_padding_sec: float,
     fps: int,
 ) -> tuple[str, list[str]]:
     pptx_path = _to_path(pptx_file, "PPTX")
     if not languages:
         raise ValueError("Select at least one language.")
+    if not output_formats:
+        raise ValueError("Select at least one output format.")
+
+    include_multilingual = "MULTI" in output_formats
+    output_language_tags = [tag for tag in output_formats if tag != "MULTI"]
+    invalid_output_languages = sorted(
+        tag for tag in output_language_tags if tag not in LANGUAGE_CHOICES
+    )
+    if invalid_output_languages:
+        raise ValueError(
+            "Unsupported output language tags: " + ", ".join(invalid_output_languages)
+        )
+
     project_root = _project_root_from_pptx(pptx_path)
 
     if slides_zip_file:
@@ -174,8 +190,12 @@ def run_step3(
         languages=languages,
         slide_padding_sec=slide_padding_sec,
         fps=fps,
+        output_language_tags=output_language_tags,
+        include_multilingual=include_multilingual,
     )
-    outputs = [*result.per_language_outputs, result.multilingual_output]
+    outputs = [*result.per_language_outputs]
+    if result.multilingual_output is not None:
+        outputs.append(result.multilingual_output)
     return (
         f"Built {len(outputs)} videos in {WorkspacePaths.from_root(project_root).output}",
         [str(path) for path in outputs],
@@ -205,8 +225,8 @@ def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Bl
             ref_text = gr.File(label="Ref Text", file_types=[".txt"], type="filepath")
             with gr.Row():
                 languages = gr.CheckboxGroup(
-                    choices=["EN", "JP", "ZH", "ES", "IT", "FR"],
-                    value=["EN", "JP", "ZH", "ES", "IT", "FR"],
+                    choices=LANGUAGE_CHOICES,
+                    value=LANGUAGE_CHOICES,
                     label="Languages",
                 )
                 model_size = gr.Dropdown(
@@ -233,6 +253,11 @@ def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Bl
             slides_zip = gr.File(label="Slides ZIP (pageN.png)", type="filepath")
             audio_zip = gr.File(
                 label="Audio ZIP (en/jp/zh/es/it/fr folders)", type="filepath"
+            )
+            output_formats = gr.CheckboxGroup(
+                choices=STEP3_OUTPUT_CHOICES,
+                value=["MULTI"],
+                label="Output Videos",
             )
             with gr.Row():
                 step3_padding = gr.Number(label="Padding Sec", value=1.5)
@@ -267,6 +292,7 @@ def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Bl
                 slides_zip,
                 audio_zip,
                 languages,
+                output_formats,
                 step3_padding,
                 step3_fps,
             ],

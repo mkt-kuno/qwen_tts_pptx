@@ -84,10 +84,11 @@ def main() -> None:
         slide_padding_sec=args.slide_padding_sec,
         fps=args.fps,
     )
-    for output in [
-        *step3_result.per_language_outputs,
-        step3_result.multilingual_output,
-    ]:
+    outputs = [*step3_result.per_language_outputs]
+    if step3_result.multilingual_output is not None:
+        outputs.append(step3_result.multilingual_output)
+
+    for output in outputs:
         logger.info("Created %s", output)
 
 
