@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 import gradio as gr
@@ -134,6 +135,7 @@ def run_step3(
 
 
 def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Blocks:
+    step1_enabled = sys.platform == "win32"
     with gr.Blocks(title="PowerPoint TTS Movie Builder") as demo:
         gr.Markdown(
             "# PowerPoint TTS Movie Builder\n"
@@ -142,7 +144,7 @@ def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Bl
 
         pptx_input = gr.File(label="PPTX", file_types=[".pptx"], type="filepath")
 
-        with gr.Tab("Step 1: Image Export (Windows)"):
+        with gr.Tab("Step 1: Image Export (Windows)", visible=step1_enabled):
             with gr.Row():
                 slide_width = gr.Number(label="Slide Width", value=2560, precision=0)
                 slide_height = gr.Number(label="Slide Height", value=1440, precision=0)
