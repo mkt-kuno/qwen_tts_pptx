@@ -9,6 +9,7 @@ import shutil
 import sys
 import wave
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +52,7 @@ class _AudioMemoryCacheEntry:
 @dataclass(frozen=True)
 class _PendingAudioGeneration:
     slide_number: int
+    language_tag: str
     qwen_language: str
     text: str
     wav_path: Path
@@ -86,6 +88,14 @@ class AudioSynthesisResult:
     active_languages: list[LanguageSpec]
     generated_count: int
     cache_hit_count: int
+
+
+@dataclass(frozen=True)
+class Step2ProgressUpdate:
+    completed_units: int
+    total_units: int
+    slide_number: int
+    language_tag: str
 
 
 @dataclass(frozen=True)
@@ -128,6 +138,7 @@ def step2_synthesize_audio(
     device: str | None,
     dtype: str | None,
     force_regenerate: bool = False,
+    progress_callback: Callable[[Step2ProgressUpdate], None] | None = None,
 ) -> AudioSynthesisResult:
     paths = WorkspacePaths.from_root(project_root)
     paths.ensure_directories()
@@ -156,6 +167,10 @@ def step2_synthesize_audio(
     active_languages = [spec for spec in language_specs if spec.tag in active_tags]
     if not active_languages:
         raise RuntimeError("No matching note tags were found in the presentation.")
+    active_tag_set = {spec.tag for spec in active_languages}
+
+    total_units = len(slide_texts) * len(language_specs)
+    completed_units = 0
 
     for spec in active_languages:
         paths.audio_dir(spec.directory_name).mkdir(parents=True, exist_ok=True)
@@ -198,7 +213,18 @@ def step2_synthesize_audio(
 
     for slide_number, tagged in slide_texts:
         pending: list[_PendingAudioGeneration] = []
-        for spec in active_languages:
+        for spec in language_specs:
+            _emit_step2_progress(
+                callback=progress_callback,
+                completed_units=completed_units,
+                total_units=total_units,
+                slide_number=slide_number,
+                language_tag=spec.tag,
+            )
+            if spec.tag not in active_tag_set:
+                completed_units += 1
+                continue
+
             text = tagged[spec.tag]
             qwen_language = language_assignments[spec.tag]
             wav_path = paths.audio_dir(spec.directory_name) / f"page{slide_number}.wav"
@@ -219,11 +245,13 @@ def step2_synthesize_audio(
                 wav_path=wav_path,
             ):
                 cache_hit_count += 1
+                completed_units += 1
                 continue
 
             pending.append(
                 _PendingAudioGeneration(
                     slide_number=slide_number,
+                    language_tag=spec.tag,
                     qwen_language=qwen_language,
                     text=text,
                     wav_path=wav_path,
@@ -267,11 +295,13 @@ def step2_synthesize_audio(
                 logger.warning(
                     "Skipping memory cache for anomalous audio (slide=%d language=%s reason=%s).",
                     item.slide_number,
-                    item.qwen_language,
+                    item.language_tag,
                     anomaly.kind,
                 )
+                completed_units += 1
                 continue
             _store_audio_memory_cache(cache_key=item.cache_key, wav_path=item.wav_path)
+            completed_units += 1
 
     logger.info(
         "Audio synthesis finished: generated=%d cache_hits=%d retries=%d",
@@ -592,3 +622,23 @@ def _read_audio_metrics(*, wav_path: Path, text_length: int) -> _AudioMetrics:
 
 def _normalized_text_length(text: str) -> int:
     return len("".join(text.split()))
+
+
+def _emit_step2_progress(
+    *,
+    callback: Callable[[Step2ProgressUpdate], None] | None,
+    completed_units: int,
+    total_units: int,
+    slide_number: int,
+    language_tag: str,
+) -> None:
+    if callback is None:
+        return
+    callback(
+        Step2ProgressUpdate(
+            completed_units=completed_units,
+            total_units=total_units,
+            slide_number=slide_number,
+            language_tag=language_tag,
+        )
+    )

@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import sys
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import gradio as gr
 
 from app.common.paths import WorkspacePaths
 from app.pipeline.steps import (
+    AudioSynthesisResult,
+    Step2ProgressUpdate,
     export_zip_from_dir,
     import_audio_zip,
     import_slide_zip,
@@ -68,7 +73,7 @@ def run_step2(
     device: str,
     dtype: str,
     force_regenerate: bool,
-) -> tuple[str, str | None]:
+) -> Iterator[tuple[str, str | None]]:
     pptx_path = _to_path(pptx_file, "PPTX")
     ref_audio = _to_path(ref_audio_file, "Ref Audio")
     ref_text = _to_path(ref_text_file, "Ref Text")
@@ -76,30 +81,73 @@ def run_step2(
         raise ValueError("Select at least one language.")
 
     project_root = _project_root_from_pptx(pptx_path)
-    result = step2_synthesize_audio(
-        pptx_path=pptx_path,
-        project_root=project_root,
-        ref_audio=ref_audio,
-        ref_text=ref_text,
-        languages=languages,
-        model_size=model_size,
-        device=device.strip() or None,
-        dtype=dtype,
-        force_regenerate=force_regenerate,
-    )
+
+    progress_updates: queue.Queue[Step2ProgressUpdate] = queue.Queue()
+    result_holder: dict[str, AudioSynthesisResult] = {}
+    error_holder: dict[str, Exception] = {}
+
+    def _on_progress(update: Step2ProgressUpdate) -> None:
+        progress_updates.put(update)
+
+    def _worker() -> None:
+        try:
+            result_holder["result"] = step2_synthesize_audio(
+                pptx_path=pptx_path,
+                project_root=project_root,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                languages=languages,
+                model_size=model_size,
+                device=device.strip() or None,
+                dtype=dtype,
+                force_regenerate=force_regenerate,
+                progress_callback=_on_progress,
+            )
+        except Exception as exc:  # pragma: no cover - forwarded to UI
+            error_holder["error"] = exc
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    yield ("Preparing Step 2 audio synthesis...", None)
+    while worker.is_alive() or not progress_updates.empty():
+        try:
+            update = progress_updates.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        yield (_format_step2_progress_status(update), None)
+
+    worker.join()
+    error = error_holder.get("error")
+    if error is not None:
+        raise error
+
+    result = result_holder.get("result")
+    if result is None:
+        raise RuntimeError("Step 2 completed without returning a result.")
+
     paths = WorkspacePaths.from_root(project_root)
     zip_path = export_zip_from_dir(
         source_dir=paths.audio,
         output_zip=paths.output / "audio.zip",
     )
-    return (
-        (
-            "Audio synthesis complete: "
-            f"slides={result.slide_count}, "
-            f"generated={result.generated_count}, "
-            f"cache_hits={result.cache_hit_count}"
-        ),
+    final_total = result.slide_count * len(languages)
+    final_status = (
+        f"{{{final_total}/{final_total}}} Audio synthesis complete: "
+        f"slides={result.slide_count}, "
+        f"generated={result.generated_count}, "
+        f"cache_hits={result.cache_hit_count}"
+    )
+    yield (
+        final_status,
         str(zip_path),
+    )
+
+
+def _format_step2_progress_status(update: Step2ProgressUpdate) -> str:
+    return (
+        f"{{{update.completed_units}/{update.total_units}}} "
+        f"Processing slide {update.slide_number} [{update.language_tag}]"
     )
 
 
