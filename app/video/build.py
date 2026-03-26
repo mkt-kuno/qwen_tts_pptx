@@ -11,6 +11,15 @@ from app.common.paths import WorkspacePaths
 
 logger = logging.getLogger(__name__)
 
+LANGUAGE_CODES: dict[str, str] = {
+    "EN": "en",
+    "JP": "ja",
+    "ZH": "zh",
+    "ES": "es",
+    "IT": "it",
+    "FR": "fr",
+}
+
 
 def build_videos(
     slide_count: int,
@@ -22,17 +31,20 @@ def build_videos(
     if slide_count <= 0:
         raise ValueError("slide_count must be positive")
 
-    durations = compute_slide_durations(
-        slide_count=slide_count,
-        languages=languages,
-        paths=paths,
-        slide_padding_sec=slide_padding_sec,
-    )
-    logger.info("Computed %d slide durations", len(durations))
     outputs: list[Path] = []
     for spec in languages:
+        durations = compute_slide_durations_for_language(
+            slide_count=slide_count,
+            language=spec,
+            paths=paths,
+            slide_padding_sec=slide_padding_sec,
+        )
+        logger.info(
+            "Computed %d slide durations for %s", len(durations), spec.tag
+        )
         audio_track = paths.temp / f"{spec.directory_name}.wav"
         video_track = paths.temp / f"{spec.directory_name}.m4v"
+        chapter_path = paths.temp / f"{spec.directory_name}.ffmeta"
         output_path = paths.output / spec.output_name
         logger.info("Building %s video assets", spec.tag)
         build_audio_track(
@@ -47,8 +59,13 @@ def build_videos(
             concat_path=paths.temp / f"{spec.directory_name}.ffconcat",
             output_path=video_track,
         )
+        write_chapter_metadata(durations=durations, output_path=chapter_path)
         mux_video_audio(
-            video_path=video_track, audio_path=audio_track, output_path=output_path
+            video_path=video_track,
+            audio_path=audio_track,
+            output_path=output_path,
+            language_code=LANGUAGE_CODES.get(spec.tag, "und"),
+            chapter_path=chapter_path,
         )
         logger.info("Finished %s video: %s", spec.tag, output_path)
         outputs.append(output_path)
@@ -73,6 +90,7 @@ def build_multilingual_video(
     output_path = paths.output / output_name
     video_track = paths.temp / "multilingual.m4v"
     concat_path = paths.temp / "multilingual.ffconcat"
+    chapter_path = paths.temp / "multilingual.ffmeta"
     build_slide_video(
         slides_dir=paths.slides,
         durations=durations,
@@ -80,6 +98,7 @@ def build_multilingual_video(
         concat_path=concat_path,
         output_path=video_track,
     )
+    write_chapter_metadata(durations=durations, output_path=chapter_path)
 
     audio_tracks: list[Path] = []
     for spec in ordered_languages:
@@ -91,25 +110,19 @@ def build_multilingual_video(
         )
         audio_tracks.append(track_path)
 
-    language_codes = {
-        "EN": "eng",
-        "JP": "jpn",
-        "ZH": "zho",
-        "ES": "spa",
-        "IT": "ita",
-        "FR": "fra",
-    }
     command = ["ffmpeg", "-y", "-i", str(video_track)]
     for audio_track in audio_tracks:
         command.extend(["-i", str(audio_track)])
+    command.extend(["-i", str(chapter_path)])
 
     command.extend(["-map", "0:v:0"])
     for index in range(len(audio_tracks)):
         command.extend(["-map", f"{index + 1}:a:0"])
+    command.extend(["-map_metadata", str(len(audio_tracks) + 1)])
 
     command.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "64k"])
     for index, spec in enumerate(ordered_languages):
-        code = language_codes.get(spec.tag, "und")
+        code = LANGUAGE_CODES.get(spec.tag, "und")
         command.extend([f"-metadata:s:a:{index}", f"language={code}"])
         command.extend([f"-metadata:s:a:{index}", f"title={spec.tag}"])
 
@@ -146,9 +159,42 @@ def compute_slide_durations(
     return durations
 
 
+def compute_slide_durations_for_language(
+    slide_count: int,
+    language: LanguageSpec,
+    paths: WorkspacePaths,
+    slide_padding_sec: float,
+) -> list[float]:
+    durations: list[float] = []
+    for slide_number in range(1, slide_count + 1):
+        wav_path = (
+            paths.audio_dir(language.directory_name) / f"page{slide_number}.wav"
+        )
+        duration = read_wav_duration(wav_path)
+        durations.append(round(duration + slide_padding_sec, 3))
+    return durations
+
+
 def read_wav_duration(path: Path) -> float:
     with wave.open(str(path), "rb") as wav_file:
         return wav_file.getnframes() / wav_file.getframerate()
+
+
+def write_chapter_metadata(durations: list[float], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [";FFMETADATA1"]
+    time_ms = 0
+    for index, duration in enumerate(durations, start=1):
+        start_ms = time_ms
+        end_ms = time_ms + int(round(duration * 1000))
+        lines.append("")
+        lines.append("[CHAPTER]")
+        lines.append("TIMEBASE=1/1000")
+        lines.append(f"START={start_ms}")
+        lines.append(f"END={end_ms}")
+        lines.append(f"title=Slide {index}")
+        time_ms = end_ms
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def build_audio_track(
@@ -237,24 +283,23 @@ def build_slide_video(
     )
 
 
-def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path) -> None:
+def mux_video_audio(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    language_code: str | None = None,
+    chapter_path: Path | None = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Muxing %s and %s into %s", video_path, audio_path, output_path)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(video_path),
-            "-i",
-            str(audio_path),
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "64k",
-            str(output_path),
-        ],
-        check=True,
-    )
+    command = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path)]
+    if chapter_path is not None:
+        command.extend(["-i", str(chapter_path)])
+    command.extend(["-map", "0:v:0", "-map", "1:a:0"])
+    if chapter_path is not None:
+        command.extend(["-map_metadata", "2"])
+    command.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "64k"])
+    if language_code is not None:
+        command.extend(["-metadata:s:a:0", f"language={language_code}"])
+    command.append(str(output_path))
+    subprocess.run(command, check=True)

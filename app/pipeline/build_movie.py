@@ -40,8 +40,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--slide-width", type=int, default=2560)
     parser.add_argument("--slide-height", type=int, default=1440)
-    parser.add_argument("--slide-padding-sec", type=float, default=1.5)
-    parser.add_argument("--fps", type=int, default=5)
+    parser.add_argument("--slide-padding-sec", type=float, default=1.0)
+    parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--force-regenerate", action="store_true")
     return parser
 

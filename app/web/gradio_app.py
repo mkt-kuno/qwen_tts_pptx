@@ -260,8 +260,8 @@ def build_app(*, default_device: str = "", default_dtype: str = "auto") -> gr.Bl
                 label="Output Videos",
             )
             with gr.Row():
-                step3_padding = gr.Number(label="Padding Sec", value=1.5)
-                step3_fps = gr.Number(label="FPS", value=5, precision=0)
+                step3_padding = gr.Number(label="Padding Sec", value=1.0)
+                step3_fps = gr.Number(label="FPS", value=24, precision=0)
             step3_run = gr.Button("Run Step 3")
             step3_status = gr.Textbox(label="Status")
             step3_outputs = gr.Files(label="MP4 Outputs")
