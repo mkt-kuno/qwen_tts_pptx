@@ -12,12 +12,12 @@ from app.common.paths import WorkspacePaths
 logger = logging.getLogger(__name__)
 
 LANGUAGE_CODES: dict[str, str] = {
-    "EN": "eng",
-    "JP": "jpn",
-    "ZH": "zho",
-    "ES": "spa",
-    "IT": "ita",
-    "FR": "fra",
+    "EN": "en",
+    "JP": "ja",
+    "ZH": "zh",
+    "ES": "es",
+    "IT": "it",
+    "FR": "fr",
 }
 
 
