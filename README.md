@@ -11,8 +11,8 @@ The app now uses a Gradio web UI and a compact three-step workflow.
 
 Outputs include:
 
-- Per-language MP4 (`en.mp4`, `jp.mp4`, `zh.mp4`, `es.mp4`, `it.mp4`, `fr.mp4`)
-- Multilingual MP4 (`multilingual.mp4`, one video track + multiple audio tracks)
+- Per-language MP4 (`en.mp4`, `jp.mp4`, `zh.mp4`, `es.mp4`, `it.mp4`, `fr.mp4`) — each with a video track sized to that language's audio duration, an ISO 639-3 language tag on the audio track, and embedded chapter markers at each slide boundary.
+- Multilingual MP4 (`multilingual.mp4`, one video track + multiple audio tracks) — video track sized to the longest language per slide, with embedded chapter markers.
 
 In `multilingual.mp4`, EN is muxed as the first audio track and marked as default.
 
