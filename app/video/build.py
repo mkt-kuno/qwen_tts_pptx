@@ -132,6 +132,7 @@ def build_multilingual_video(
         for index in range(1, len(ordered_languages)):
             command.extend([f"-disposition:a:{index}", "0"])
 
+    command.extend(["-movflags", "+faststart"])
     command.append(str(output_path))
     logger.info("Building multilingual video %s", output_path)
     subprocess.run(command, check=True)
@@ -305,5 +306,6 @@ def mux_video_audio(
         command.extend(["-metadata:s:a:0", f"language={language_code}"])
     if track_title is not None:
         command.extend(["-metadata:s:a:0", f"title={track_title}"])
+    command.extend(["-movflags", "+faststart"])
     command.append(str(output_path))
     subprocess.run(command, check=True)
