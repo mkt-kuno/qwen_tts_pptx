@@ -9,6 +9,7 @@ class LanguageSpec:
     directory_name: str
     qwen_language: str
     output_name: str
+    track_name: str
 
 
 LANGUAGE_SPECS: dict[str, LanguageSpec] = {
@@ -17,36 +18,42 @@ LANGUAGE_SPECS: dict[str, LanguageSpec] = {
         directory_name="en",
         qwen_language="English",
         output_name="en.mp4",
+        track_name="English",
     ),
     "JP": LanguageSpec(
         tag="JP",
         directory_name="jp",
         qwen_language="Japanese",
         output_name="jp.mp4",
+        track_name="日本語",
     ),
     "ZH": LanguageSpec(
         tag="ZH",
         directory_name="zh",
         qwen_language="Chinese",
         output_name="zh.mp4",
+        track_name="中文",
     ),
     "ES": LanguageSpec(
         tag="ES",
         directory_name="es",
         qwen_language="Spanish",
         output_name="es.mp4",
+        track_name="Español",
     ),
     "IT": LanguageSpec(
         tag="IT",
         directory_name="it",
         qwen_language="Italian",
         output_name="it.mp4",
+        track_name="Italiano",
     ),
     "FR": LanguageSpec(
         tag="FR",
         directory_name="fr",
         qwen_language="French",
         output_name="fr.mp4",
+        track_name="Français",
     ),
 }
 
