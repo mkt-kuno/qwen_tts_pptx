@@ -12,12 +12,12 @@ from app.common.paths import WorkspacePaths
 logger = logging.getLogger(__name__)
 
 LANGUAGE_CODES: dict[str, str] = {
-    "EN": "en",
-    "JP": "ja",
-    "ZH": "zh",
-    "ES": "es",
-    "IT": "it",
-    "FR": "fr",
+    "EN": "eng",
+    "JP": "jpn",
+    "ZH": "chi",
+    "ES": "spa",
+    "IT": "ita",
+    "FR": "fre",
 }
 
 
@@ -65,6 +65,7 @@ def build_videos(
             audio_path=audio_track,
             output_path=output_path,
             language_code=LANGUAGE_CODES.get(spec.tag, "und"),
+            track_title=spec.track_name,
             chapter_path=chapter_path,
         )
         logger.info("Finished %s video: %s", spec.tag, output_path)
@@ -124,7 +125,7 @@ def build_multilingual_video(
     for index, spec in enumerate(ordered_languages):
         code = LANGUAGE_CODES.get(spec.tag, "und")
         command.extend([f"-metadata:s:a:{index}", f"language={code}"])
-        command.extend([f"-metadata:s:a:{index}", f"title={spec.tag}"])
+        command.extend([f"-metadata:s:a:{index}", f"title={spec.track_name}"])
 
     if ordered_languages and ordered_languages[0].tag == "EN":
         command.extend(["-disposition:a:0", "default"])
@@ -288,6 +289,7 @@ def mux_video_audio(
     audio_path: Path,
     output_path: Path,
     language_code: str | None = None,
+    track_title: str | None = None,
     chapter_path: Path | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,5 +303,7 @@ def mux_video_audio(
     command.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "64k"])
     if language_code is not None:
         command.extend(["-metadata:s:a:0", f"language={language_code}"])
+    if track_title is not None:
+        command.extend(["-metadata:s:a:0", f"title={track_title}"])
     command.append(str(output_path))
     subprocess.run(command, check=True)
