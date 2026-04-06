@@ -293,14 +293,19 @@ def step2_synthesize_audio(
             pending.append(item)
 
         if pending:
-            zh_items = [item for item in pending if item.language_tag.upper() == "ZH"]
-            other_items = [item for item in pending if item.language_tag.upper() != "ZH"]
+            zh_items: list[_PendingAudioGeneration] = []
+            other_items: list[_PendingAudioGeneration] = []
+            for item in pending:
+                if item.language_tag.upper() == "ZH":
+                    zh_items.append(item)
+                else:
+                    other_items.append(item)
             _synthesize_items(model, prompt, other_items, SAFE_VOICE_CLONE_GENERATION_PARAMS)
             _synthesize_items(model, prompt, zh_items, SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH)
             generated_count += len(pending)
 
         for item in slide_items:
-            item_params = _params_for_item(item)
+            item_params = _dynamic_params_for_item(item)
             retry_count += _retry_if_anomalous_audio(
                 model=model,
                 prompt=prompt,
@@ -316,7 +321,7 @@ def step2_synthesize_audio(
             outlier = _find_duration_outlier_in_slide(slide_items)
             if outlier is None:
                 break
-            outlier_params = _params_for_item(outlier.item)
+            outlier_params = _dynamic_params_for_item(outlier.item)
             retry_count += _retry_duration_outlier(
                 model=model,
                 prompt=prompt,
@@ -480,7 +485,7 @@ def _generation_params_for_tag(language_tag: str) -> VoiceCloneGenerationParams:
     return SAFE_VOICE_CLONE_GENERATION_PARAMS
 
 
-def _params_for_item(item: _PendingAudioGeneration) -> VoiceCloneGenerationParams:
+def _dynamic_params_for_item(item: _PendingAudioGeneration) -> VoiceCloneGenerationParams:
     """Return generation params with a dynamic max_new_tokens cap for a single item."""
     base = _generation_params_for_tag(item.language_tag)
     dynamic_max = compute_max_new_tokens(
