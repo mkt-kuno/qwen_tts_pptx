@@ -61,14 +61,14 @@ class LoadedModel:
 @dataclass(frozen=True)
 class VoiceCloneGenerationParams:
     do_sample: bool = True
-    top_k: int = 30
-    top_p: float = 0.9
-    temperature: float = 1.0
-    repetition_penalty: float = 1.2
+    top_k: int = 50
+    top_p: float = 1.0
+    temperature: float = 0.9
+    repetition_penalty: float = 1.05
     subtalker_dosample: bool = True
-    subtalker_top_k: int = 30
-    subtalker_top_p: float = 0.9
-    subtalker_temperature: float = 1.0
+    subtalker_top_k: int = 50
+    subtalker_top_p: float = 1.0
+    subtalker_temperature: float = 0.9
     max_new_tokens: int = 2048
 
     def as_generate_kwargs(self) -> dict[str, Any]:
@@ -86,7 +86,46 @@ class VoiceCloneGenerationParams:
         }
 
 
+# General-purpose params aligned with the official Qwen3-TTS sample defaults.
 SAFE_VOICE_CLONE_GENERATION_PARAMS = VoiceCloneGenerationParams()
+
+# Conservative params for Chinese (ZH) synthesis.
+# Lower temperature and repetition_penalty reduce the chance of the model
+# looping instead of emitting an EOS token, which is the primary cause of
+# runaway audio in Chinese runs.
+SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH = VoiceCloneGenerationParams(
+    temperature=0.85,
+    repetition_penalty=1.02,
+)
+
+# Acoustic token budget per text character, used to cap max_new_tokens
+# to a value proportional to the input length.  At 12 Hz, Chinese
+# requires more tokens per character than Latin-script languages.
+_MAX_NEW_TOKENS_PER_CHAR: dict[str, int] = {
+    "Chinese": 15,
+}
+_MAX_NEW_TOKENS_PER_CHAR_DEFAULT = 10
+_MAX_NEW_TOKENS_PADDING = 200
+_MAX_NEW_TOKENS_FLOOR = 300
+
+
+def compute_max_new_tokens(texts: list[str], languages: list[str], cap: int) -> int:
+    """Return the tightest max_new_tokens sufficient for all (text, language) pairs.
+
+    The value is computed from character counts so the model cannot run away
+    beyond a multiple of the input length.  It is always clamped to
+    [_MAX_NEW_TOKENS_FLOOR, cap].
+    """
+    needed = _MAX_NEW_TOKENS_FLOOR
+    for text, language in zip(texts, languages):
+        char_count = len("".join(text.split()))
+        if char_count == 0:
+            continue
+        tokens_per_char = _MAX_NEW_TOKENS_PER_CHAR.get(
+            language, _MAX_NEW_TOKENS_PER_CHAR_DEFAULT
+        )
+        needed = max(needed, char_count * tokens_per_char + _MAX_NEW_TOKENS_PADDING)
+    return min(needed, cap)
 
 
 def detect_device(requested: str | None) -> str:
