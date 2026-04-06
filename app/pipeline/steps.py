@@ -565,6 +565,7 @@ def _retry_if_anomalous_audio(
             language=qwen_language,
             output_path=output_path,
             generation_params=generation_params,
+            seed=attempt,
         )
         retry_count += 1
         anomaly = _detect_audio_anomaly(
@@ -678,6 +679,7 @@ def _retry_duration_outlier(
             language=item.qwen_language,
             output_path=item.wav_path,
             generation_params=generation_params,
+            seed=attempt,
         )
         retry_count += 1
 

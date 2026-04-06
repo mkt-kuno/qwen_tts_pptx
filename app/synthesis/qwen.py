@@ -315,11 +315,15 @@ def synthesize_to_file(
     language: str,
     output_path: Path,
     generation_params: VoiceCloneGenerationParams = SAFE_VOICE_CLONE_GENERATION_PARAMS,
+    seed: int | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not text.strip():
         write_silence_wav(output_path)
         return
+
+    if seed is not None:
+        torch.manual_seed(seed)
 
     try:
         wavs, sample_rate = model.generate_voice_clone(
