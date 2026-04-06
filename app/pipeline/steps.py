@@ -11,7 +11,7 @@ import sys
 import wave
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from app.common.languages import LanguageSpec, resolve_languages
@@ -21,7 +21,9 @@ from app.models.voices import resolve_voice_asset
 from app.slides.export_slides import export_slides
 from app.synthesis.qwen import (
     SAFE_VOICE_CLONE_GENERATION_PARAMS,
+    SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH,
     VoiceCloneGenerationParams,
+    compute_max_new_tokens,
     create_voice_clone_prompt,
     detect_device,
     load_model,
@@ -55,7 +57,7 @@ ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_RATIO_BY_TAG: dict[str, float] = {
 ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_DURATION_SEC = 8.0
 ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_GAP_SEC = 2.5
 ANOMALOUS_AUDIO_DURATION_OUTLIER_MIN_PEERS = 2
-ANOMALOUS_AUDIO_RETRY_LIMIT = 1
+ANOMALOUS_AUDIO_RETRY_LIMIT = 3
 
 
 @dataclass(frozen=True)
@@ -207,13 +209,20 @@ def step2_synthesize_audio(
     model = model_result.model
     resolved_device = model_result.device
     resolved_dtype = model_result.dtype_name
-    generation_params = SAFE_VOICE_CLONE_GENERATION_PARAMS
     logger.info(
-        "Using conservative generation params: temperature=%.2f top_p=%.2f top_k=%d repetition_penalty=%.2f dtype=%s",
-        generation_params.temperature,
-        generation_params.top_p,
-        generation_params.top_k,
-        generation_params.repetition_penalty,
+        "Generation params (non-ZH): temperature=%.2f top_p=%.2f top_k=%d repetition_penalty=%.2f dtype=%s",
+        SAFE_VOICE_CLONE_GENERATION_PARAMS.temperature,
+        SAFE_VOICE_CLONE_GENERATION_PARAMS.top_p,
+        SAFE_VOICE_CLONE_GENERATION_PARAMS.top_k,
+        SAFE_VOICE_CLONE_GENERATION_PARAMS.repetition_penalty,
+        resolved_dtype,
+    )
+    logger.info(
+        "Generation params (ZH): temperature=%.2f top_p=%.2f top_k=%d repetition_penalty=%.2f dtype=%s",
+        SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH.temperature,
+        SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH.top_p,
+        SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH.top_k,
+        SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH.repetition_penalty,
         resolved_dtype,
     )
     prompt = create_voice_clone_prompt(
@@ -251,6 +260,7 @@ def step2_synthesize_audio(
             text = tagged[spec.tag]
             qwen_language = language_assignments[spec.tag]
             wav_path = paths.audio_dir(spec.directory_name) / f"page{slide_number}.wav"
+            item_params = _generation_params_for_tag(spec.tag)
             cache_key = _build_audio_memory_cache_key(
                 text=text,
                 language_tag=spec.tag,
@@ -260,7 +270,7 @@ def step2_synthesize_audio(
                 dtype_name=resolved_dtype,
                 ref_audio_sha256=ref_audio_hash,
                 ref_text_sha256=ref_text_hash,
-                generation_params=generation_params,
+                generation_params=item_params,
             )
             item = _PendingAudioGeneration(
                 slide_number=slide_number,
@@ -283,17 +293,19 @@ def step2_synthesize_audio(
             pending.append(item)
 
         if pending:
-            synthesize_batch_to_files(
-                model=model,
-                prompt=prompt,
-                texts=[item.text for item in pending],
-                languages=[item.qwen_language for item in pending],
-                output_paths=[item.wav_path for item in pending],
-                generation_params=generation_params,
-            )
+            zh_items: list[_PendingAudioGeneration] = []
+            other_items: list[_PendingAudioGeneration] = []
+            for item in pending:
+                if item.language_tag.upper() == "ZH":
+                    zh_items.append(item)
+                else:
+                    other_items.append(item)
+            _synthesize_items(model, prompt, other_items, SAFE_VOICE_CLONE_GENERATION_PARAMS)
+            _synthesize_items(model, prompt, zh_items, SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH)
             generated_count += len(pending)
 
         for item in slide_items:
+            item_params = _dynamic_params_for_item(item)
             retry_count += _retry_if_anomalous_audio(
                 model=model,
                 prompt=prompt,
@@ -302,18 +314,19 @@ def step2_synthesize_audio(
                 qwen_language=item.qwen_language,
                 text=item.text,
                 output_path=item.wav_path,
-                generation_params=generation_params,
+                generation_params=item_params,
             )
 
         for _ in range(len(slide_items)):
             outlier = _find_duration_outlier_in_slide(slide_items)
             if outlier is None:
                 break
+            outlier_params = _dynamic_params_for_item(outlier.item)
             retry_count += _retry_duration_outlier(
                 model=model,
                 prompt=prompt,
                 outlier=outlier,
-                generation_params=generation_params,
+                generation_params=outlier_params,
             )
 
         pending_cache_keys = {item.cache_key for item in pending}
@@ -465,6 +478,59 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _generation_params_for_tag(language_tag: str) -> VoiceCloneGenerationParams:
+    """Return the appropriate generation params for a language tag."""
+    if language_tag.upper() == "ZH":
+        return SAFE_VOICE_CLONE_GENERATION_PARAMS_ZH
+    return SAFE_VOICE_CLONE_GENERATION_PARAMS
+
+
+def _dynamic_params_for_item(item: _PendingAudioGeneration) -> VoiceCloneGenerationParams:
+    """Return generation params with a dynamic max_new_tokens cap for a single item."""
+    base = _generation_params_for_tag(item.language_tag)
+    dynamic_max = compute_max_new_tokens(
+        texts=[item.text],
+        languages=[item.qwen_language],
+        cap=base.max_new_tokens,
+    )
+    if dynamic_max == base.max_new_tokens:
+        return base
+    return replace(base, max_new_tokens=dynamic_max)
+
+
+def _synthesize_items(
+    model,
+    prompt,
+    items: list[_PendingAudioGeneration],
+    base_params: VoiceCloneGenerationParams,
+) -> None:
+    """Synthesize a group of items sharing the same base params.
+
+    max_new_tokens is tightened to the minimum value sufficient for the
+    longest text in the batch so the model cannot run away indefinitely.
+    """
+    if not items:
+        return
+    dynamic_max = compute_max_new_tokens(
+        texts=[item.text for item in items],
+        languages=[item.qwen_language for item in items],
+        cap=base_params.max_new_tokens,
+    )
+    params = (
+        replace(base_params, max_new_tokens=dynamic_max)
+        if dynamic_max != base_params.max_new_tokens
+        else base_params
+    )
+    synthesize_batch_to_files(
+        model=model,
+        prompt=prompt,
+        texts=[item.text for item in items],
+        languages=[item.qwen_language for item in items],
+        output_paths=[item.wav_path for item in items],
+        generation_params=params,
+    )
+
+
 def _build_audio_memory_cache_key(
     *,
     text: str,
@@ -565,6 +631,7 @@ def _retry_if_anomalous_audio(
             language=qwen_language,
             output_path=output_path,
             generation_params=generation_params,
+            seed=attempt,
         )
         retry_count += 1
         anomaly = _detect_audio_anomaly(
@@ -678,6 +745,7 @@ def _retry_duration_outlier(
             language=item.qwen_language,
             output_path=item.wav_path,
             generation_params=generation_params,
+            seed=attempt,
         )
         retry_count += 1
 
